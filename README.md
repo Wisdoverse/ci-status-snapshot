@@ -6,7 +6,7 @@ An agent skill for reading CI/PR/MR state cheaply. Coding agents burn tokens re-
 - a silent local watcher that polls without model turns and prints exactly one JSON event when the state actually changes,
 - a GitLab auto-merge delegation snapshot that confirms the merge is server-side delegated, or names the blocker.
 
-`SKILL.md` is the agent-facing contract (loaded by Codex and Claude Code). This README is for humans.
+`SKILL.md` is the agent-facing contract that Codex and Claude Code load on every trigger; it stays lean on purpose. The deeper playbooks — `references/gitlab-triage.md` (failed/stuck GitLab jobs) and `references/merge-flow.md` (merge and auto-merge delegation) — are read on demand, only when their trigger condition is met. This README is for humans.
 
 ## The contract
 
