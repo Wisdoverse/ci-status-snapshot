@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # floor and current: the scripts must stay stdlib-only on both
+        python-version: ["3.9", "3.14"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      # no install step on purpose: zero dependencies is part of the contract
+      - run: python3 scripts/test_ci_status_snapshot.py
+      - run: python3 scripts/test_ci_state_watch.py
+      - run: python3 scripts/test_ci_merge_delegate.py

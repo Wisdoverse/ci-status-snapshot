@@ -14,7 +14,7 @@ from typing import Any
 from ci_status_snapshot import detect_provider, github_snapshot, gitlab_snapshot
 
 
-def take_snapshot(provider: str, selector: str | None) -> dict[str, Any]:
+def take_snapshot(provider: str, selector: str) -> dict[str, Any]:
     resolved = detect_provider() if provider == "auto" else provider
     if resolved == "unknown":
         raise RuntimeError("Could not detect provider; pass --provider github or --provider gitlab")
@@ -95,7 +95,10 @@ def watch(
 def main() -> int:
     parser = argparse.ArgumentParser(description="Watch CI outside model turns and emit one state event.")
     parser.add_argument("--provider", choices=["auto", "github", "gitlab"], default="auto")
-    parser.add_argument("--selector", help="PR/MR number, URL, or branch selector")
+    # required on purpose: without it gh/glab resolve "the PR of the current
+    # branch" on every poll, so any checkout during the watcher's (up to 2h)
+    # life silently retargets the watch at a different PR/MR
+    parser.add_argument("--selector", required=True, help="PR/MR number, URL, or branch selector")
     parser.add_argument("--interval-seconds", type=float, default=30.0)
     parser.add_argument("--error-threshold", type=int, default=3)
     parser.add_argument("--timeout-seconds", type=float, default=7200.0, help="backstop against orphan processes; 0 waits indefinitely")

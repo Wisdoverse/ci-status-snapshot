@@ -19,26 +19,9 @@ from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import quote, urlparse
 
-
-PIPELINE_FAIL_STATES = {"failed", "canceled", "cancelled", "skipped", "manual"}
-PIPELINE_PENDING_STATES = {
-    "created",
-    "pending",
-    "preparing",
-    "running",
-    "scheduled",
-    "waiting",
-    "waiting_for_resource",
-}
-PIPELINE_SUCCESS_STATES = {"success", "passed", "succeeded"}
-MERGE_BLOCK_STATES = {
-    "blocked_status",
-    "cannot_be_merged",
-    "conflict",
-    "discussions_not_resolved",
-    "need_rebase",
-    "not_approved",
-}
+# One decision, one set of state tables: this helper names its results from the
+# same classifier the snapshot uses, so a provider enum change is a one-file fix.
+from ci_status_snapshot import PENDING_STATES, SUCCESS_STATES, classify_gitlab
 
 
 def run(cmd: list[str], timeout: int = 25) -> tuple[int, str, str]:
@@ -137,12 +120,23 @@ def glab_api(path: str, timeout: int = 25) -> tuple[int, Any | None, str]:
     return 0, load_json_or_die(out, f"glab api {path}"), ""
 
 
-def failed_jobs(project: str, pipeline_id: Any) -> list[dict[str, Any]]:
+def failed_jobs(project: str, pipeline_id: Any) -> tuple[list[dict[str, Any]] | None, str]:
+    """Return (jobs, error). Never (empty list, "") on failure.
+
+    An API/parse error that returned [] would read as "the pipeline failed but no
+    job failed", which sends the agent looking for a phantom infra problem. The
+    caller emits failed_jobs_error instead so the two cases stay distinguishable.
+    """
     if pipeline_id in (None, ""):
-        return []
-    code, data, _ = glab_api(f"projects/{project_api_id(project)}/pipelines/{pipeline_id}/jobs?per_page=100")
-    if code != 0 or not isinstance(data, list):
-        return []
+        return None, "merge request has no head pipeline id"
+    try:
+        code, data, err = glab_api(f"projects/{project_api_id(project)}/pipelines/{pipeline_id}/jobs?per_page=100")
+    except SystemExit as exc:  # load_json_or_die: glab printed something that is not JSON
+        return None, str(exc)
+    if code != 0:
+        return None, err or f"glab api exited {code}"
+    if not isinstance(data, list):
+        return None, "unexpected jobs payload: expected a JSON list"
 
     jobs: list[dict[str, Any]] = []
     for job in data:
@@ -160,7 +154,7 @@ def failed_jobs(project: str, pipeline_id: Any) -> list[dict[str, Any]]:
                 "web_url": first(job, "web_url", "webUrl"),
             }
         )
-    return jobs
+    return jobs, ""
 
 
 def base_result(result: str, project: str, mr: str, data: dict[str, Any]) -> dict[str, Any]:
@@ -211,11 +205,21 @@ def supervise_gitlab_mr(args: argparse.Namespace) -> int:
         return 4
 
     result = base_result("", project, mr, data)
-    state = norm(data.get("state"))
+    # base_result reports "unknown" when the MR carries no head pipeline (or one
+    # with no status): either way there is no pipeline state to classify
     pipeline_status = norm(result["pipeline_status"])
-    merge_status = norm(result["merge_status"])
+    no_pipeline = pipeline_status == "unknown"
+    if no_pipeline:
+        pipeline_status = ""
+    _conclusion, cause, _reason = classify_gitlab(
+        norm(data.get("state")),
+        pipeline_status,
+        norm(first(data, "detailed_merge_status", "detailedMergeStatus")),
+        norm(first(data, "merge_status", "mergeStatus")),
+        bool(first(data, "draft", "work_in_progress", "workInProgress")),
+    )
 
-    if state == "merged":
+    if cause == "merged":
         result.update(
             {
                 "result": "merged",
@@ -226,43 +230,58 @@ def supervise_gitlab_mr(args: argparse.Namespace) -> int:
         print_result(result, args.json)
         return 0
 
-    if state == "closed":
+    if cause == "closed":
         result["result"] = "closed_unmerged"
         print_result(result, args.json)
         return 3
 
-    # skipped ([ci skip]/rules) does not block a mergeable gate; align with
-    # ci_status_snapshot.py instead of triaging a pipeline with no failed jobs
-    if pipeline_status == "skipped" and merge_status == "mergeable":
-        if result["auto_merge"]:
-            result["result"] = "delegated_auto_merge"
-            print_result(result, args.json)
-            return 0
-        result["result"] = "pipeline_skipped_mergeable"
-        print_result(result, args.json)
-        return 3
-
-    if pipeline_status in PIPELINE_FAIL_STATES:
+    if cause == "pipeline":
+        # terminal CI state (failed/canceled/manual, or skipped where the gate
+        # requires a pipeline): hand over the jobs the agent has to triage
         result["result"] = f"pipeline_{pipeline_status}"
-        result["failed_jobs"] = failed_jobs(project, result.get("pipeline_id"))
+        jobs, jobs_error = failed_jobs(project, result.get("pipeline_id"))
+        if jobs_error:
+            result["failed_jobs_error"] = jobs_error
+        else:
+            result["failed_jobs"] = jobs
         print_result(result, args.json)
         return 2
 
-    if merge_status in MERGE_BLOCK_STATES:
+    if cause in {"merge_gate", "human_gate"}:
+        # conflict/rebase/requested changes, or an approval/discussion gate: the
+        # snapshot may keep waiting for a human, this one-shot helper cannot
         result["result"] = "merge_blocked"
         print_result(result, args.json)
         return 3
 
-    if pipeline_status in PIPELINE_SUCCESS_STATES:
+    if cause == "mergeable":
         if result["auto_merge"]:
             result["result"] = "delegated_auto_merge"
             print_result(result, args.json)
             return 0
-        result["result"] = "pipeline_success_unmerged"
+        if pipeline_status == "skipped":
+            result["result"] = "pipeline_skipped_mergeable"
+        elif pipeline_status in SUCCESS_STATES:
+            result["result"] = "pipeline_success_unmerged"
+        else:
+            result["result"] = "mergeable_unmerged"
         print_result(result, args.json)
         return 3
 
-    if result["auto_merge"] and pipeline_status in PIPELINE_PENDING_STATES:
+    if no_pipeline:
+        # not the same as waiting for CI: an MR with no head pipeline may still
+        # be registering one, or may never create one (rules, no .gitlab-ci.yml)
+        result["result"] = "no_pipeline_observed"
+        print_result(result, args.json)
+        return 0
+
+    # auto-merge is armed server-side, so anything that clears itself will merge
+    # without us: a pipeline still running, or a gate still settling (checking,
+    # approvals_syncing, merge_time, preparing, ...). Gate on the classified
+    # cause, never on the raw pipeline status — a draft with a running pipeline
+    # is cause "draft", and GitLab does not auto-merge drafts. Human gates are
+    # excluded too: cause "human_gate" already returned merge_blocked above.
+    if result["auto_merge"] and cause in {"pipeline_pending", "merge_gate_pending"}:
         result["result"] = "delegated_auto_merge"
     else:
         result["result"] = "waiting"
@@ -271,7 +290,17 @@ def supervise_gitlab_mr(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Take one GitLab MR auto-merge delegation snapshot.")
+    parser = argparse.ArgumentParser(
+        description="Take one GitLab MR auto-merge delegation snapshot.",
+        epilog=(
+            "Exit codes: 0 = nothing to do now (result is merged, delegated_auto_merge, "
+            "waiting, or no_pipeline_observed), 2 = terminal pipeline state, triage the "
+            "failed jobs, 3 = a human must act (closed_unmerged, merge_blocked, "
+            "*_unmerged/mergeable), 4 = api_error. Exit 0 is NOT 'merged': always read "
+            "the `result` field."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument("--provider", choices=["gitlab"], default="gitlab")
     parser.add_argument("--selector", required=True, help="GitLab MR IID or MR URL")
     parser.add_argument("--project", help="GitLab project id or path. Defaults to CI_PROJECT_ID or git remote path.")

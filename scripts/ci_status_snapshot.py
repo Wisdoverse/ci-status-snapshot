@@ -11,6 +11,11 @@ from datetime import datetime, timezone
 from typing import Any
 
 
+# Provider enums verified 2026-08 against docs.github.com/en/graphql/reference/enums
+# (CheckStatusState, CheckConclusionState, StatusState, MergeStateStatus) and
+# docs.gitlab.com/api/pipelines + /api/merge_requests/#merge-status. Values that
+# older self-hosted GitLab versions still return are kept next to their
+# replacements: the wire format is whatever the server runs, not what the docs say.
 FAIL_STATES = {
     "action_required",
     "canceled",
@@ -23,6 +28,7 @@ FAIL_STATES = {
     "timed_out",
 }
 PENDING_STATES = {
+    "canceling",
     "created",
     "expected",
     "in_progress",
@@ -36,9 +42,66 @@ PENDING_STATES = {
     "running",
     "scheduled",
     "waiting",
+    "waiting_for_callback",
     "waiting_for_resource",
 }
-SUCCESS_STATES = {"completed", "mergeable", "passed", "success", "succeeded"}
+# "completed" is deliberately NOT here: a GitHub check run reports status
+# COMPLETED with a null conclusion during the conclusion write-back window, and
+# an absent conclusion is not evidence of success.
+SUCCESS_STATES = {"mergeable", "passed", "success", "succeeded"}
+
+# GitHub mergeStateStatus. CLEAN ("mergeable and passing commit status") and
+# HAS_HOOKS ("mergeable with passing commit status and pre-receive hooks") are
+# the only two positive states; everything else is either fixable now or still
+# moving, and an unrecognized value must never read as success.
+GH_MERGE_ACTION = {"behind", "dirty"}
+GH_MERGE_OK = {"clean", "has_hooks"}
+# UNSTABLE is "mergeable with non-passing commit status" — a real check failure
+# already returns ACTION from the failed-check branch above it, so what is left
+# here is a flaky/required-but-unfinished context: wait, do not merge.
+GH_MERGE_WAIT = {"blocked", "draft", "unknown", "unstable"}
+
+# GitLab detailed_merge_status. Concrete blockers: these never clear by waiting,
+# someone has to change the branch, the title, the locks, or the policy result.
+GL_GATE_ACTION = {
+    "broken_status",  # old name of "conflict", still emitted up to GitLab 16.6
+    "commits_status",
+    "conflict",
+    "jira_association_missing",
+    "locked_lfs_files",
+    "locked_paths",
+    "need_rebase",
+    "policies_denied",  # old name of "security_policy_violations", up to 16.6
+    "requested_changes",
+    "security_policy_violations",
+    "title_regex",
+}
+# Needs a person, but nothing about it is fixable by the agent. The snapshot
+# waits (an approval can arrive without a push, so this is a review-pending
+# state, not a failure); the one-shot merge delegate treats the same set as
+# terminal because it has no one to wait for.
+GL_GATE_HUMAN = {
+    "blocked_status",  # old name of "merge_request_blocked", emitted up to 17.0
+    "discussions_not_resolved",
+    "merge_request_blocked",
+    "not_approved",
+}
+# Remote is still computing, or the gate clears itself without local work.
+GL_GATE_WAIT = {
+    "approvals_syncing",
+    "checking",
+    "ci_must_pass",
+    "ci_still_running",
+    "draft_status",
+    "external_status_checks",  # old name of "status_checks_must_pass", up to 17.0
+    "merge_time",
+    "not_open",  # merged/closed is decided from `state` before this is read
+    "preparing",
+    "security_policy_pipeline_check",  # the policy pipeline is still evaluating
+    "status_checks_must_pass",
+    "unchecked",
+}
+GL_LEGACY_MERGE_ACTION = {"cannot_be_merged", "cannot be merged"}
 
 
 def run(cmd: list[str], timeout: int = 25) -> tuple[int, str, str]:
@@ -125,7 +188,11 @@ def github_snapshot(selector: str | None) -> dict[str, Any]:
     data = load_json_or_die(out, "gh pr view")
     checks = [summarize_github_check(item) for item in data.get("statusCheckRollup") or [] if isinstance(item, dict)]
     failed = [c for c in checks if c["effective"] in FAIL_STATES]
-    pending = [c for c in checks if c["effective"] in PENDING_STATES or c["status"] in PENDING_STATES]
+    # COMPLETED with no conclusion yet: GitHub is still writing the conclusion
+    # back, so the run counts as pending and gets its own reason instead of
+    # silently landing in the "not success, not pending" hole
+    settling = [c for c in checks if c["status"] == "completed" and not c["conclusion"]]
+    pending = [c for c in checks if c["effective"] in PENDING_STATES or c["status"] in PENDING_STATES] + settling
     # skipped/neutral GitHub check conclusions are non-blocking, count as done
     success = [c for c in checks if c["effective"] in SUCCESS_STATES or c["conclusion"] in {"success", "skipped", "neutral"}]
 
@@ -136,14 +203,20 @@ def github_snapshot(selector: str | None) -> dict[str, Any]:
     # most actionable first: reason/report use blockers[0]
     if failed:
         blockers.append(f"{len(failed)} failed check(s)")
-    if merge_state in {"dirty", "behind"}:
+    if merge_state in GH_MERGE_ACTION:
         blockers.append(f"merge state: {merge_state}")
     if review == "changes_requested":
         blockers.append("changes requested")
     elif review == "review_required":
         blockers.append("review required")
+    if settling:
+        blockers.append(f"{len(settling)} check(s) completed without a conclusion")
     if pending:
         blockers.append(f"{len(pending)} pending check(s)")
+    if merge_state == "unknown":
+        blockers.append("merge state still computing")
+    elif merge_state in GH_MERGE_WAIT:
+        blockers.append(f"merge state: {merge_state}")
     if data.get("isDraft"):
         blockers.append("draft")
 
@@ -151,15 +224,20 @@ def github_snapshot(selector: str | None) -> dict[str, Any]:
         conclusion, reason = "DONE", "PR is merged"
     elif state == "closed":
         conclusion, reason = "DONE", "PR is closed"
-    elif failed or review == "changes_requested" or merge_state in {"dirty", "behind"}:
+    elif failed or review == "changes_requested" or merge_state in GH_MERGE_ACTION:
         conclusion, reason = "ACTION", blockers[0]
-    elif pending or data.get("isDraft") or review == "review_required" or merge_state in {"blocked", "has_hooks", "unstable"}:
+    elif pending or data.get("isDraft") or review == "review_required" or merge_state in GH_MERGE_WAIT:
         conclusion, reason = "WAIT", blockers[0] if blockers else "remote gate is still pending"
+    elif merge_state not in GH_MERGE_OK:
+        # DONE needs positive merge evidence from GitHub itself: green checks
+        # with an absent/unrecognized mergeStateStatus prove nothing about
+        # branch protection, required reviews, or rulesets
+        conclusion, reason = "WAIT", f"unrecognized merge state: {merge_state}" if merge_state else "no actionable failure in one-shot snapshot"
     elif checks and len(success) == len(checks):
         conclusion, reason = "DONE", "checks are green"
-    elif not checks and merge_state == "clean":
+    elif not checks:
         # ambiguous right after a push: checks may still be registering
-        conclusion, reason = "DONE", "no checks reported; merge state is clean (checks may still be registering if just pushed)"
+        conclusion, reason = "DONE", f"no checks reported; merge state is {merge_state} (checks may still be registering if just pushed)"
     else:
         conclusion, reason = "WAIT", "no actionable failure in one-shot snapshot"
 
@@ -185,6 +263,74 @@ def github_snapshot(selector: str | None) -> dict[str, Any]:
     }
 
 
+def classify_gitlab(
+    state: str,
+    pipeline_status: str,
+    detailed_merge: str,
+    merge_status: str,
+    draft: bool,
+) -> tuple[str, str, str]:
+    """The one GitLab MR decision, shared with ci_merge_delegate.py.
+
+    Returns (conclusion, cause, reason). `cause` is a stable machine token so the
+    merge delegate can name its result from this decision instead of keeping a
+    second copy of the state tables that drifts away from this one. All inputs
+    are already normalized (lowercase, "" when absent).
+    """
+    # manual pipelines are terminal without a human. skipped ([ci skip], rules
+    # filtering) only blocks when the merge gate actually requires a pipeline
+    # ("ci_must_pass") or on legacy servers with no detailed_merge_status at all
+    # ("", fail-safe); a skipped pipeline on an otherwise mergeable MR is normal.
+    actionable_pipeline = (
+        pipeline_status in FAIL_STATES
+        or pipeline_status == "manual"
+        or (pipeline_status == "skipped" and detailed_merge in {"", "ci_must_pass"})
+    )
+    if state == "merged":
+        return "DONE", "merged", "MR is merged"
+    if state == "closed":
+        return "DONE", "closed", "MR is closed"
+    if actionable_pipeline:
+        return "ACTION", "pipeline", f"pipeline {pipeline_status}"
+    if detailed_merge in GL_GATE_ACTION or merge_status in GL_LEGACY_MERGE_ACTION:
+        return "ACTION", "merge_gate", f"merge state: {detailed_merge or merge_status}"
+    if draft:
+        # a draft never merges, whatever the gate says: GitLab can still report
+        # mergeable from a stale mergeability recompute (right after a title
+        # change, say), so draft outranks every DONE path — but not a red
+        # pipeline, which stays actionable on a draft like anywhere else
+        return "WAIT", "draft", "draft"
+    if detailed_merge == "mergeable" and pipeline_status in PENDING_STATES:
+        # where CI is not a required merge check, GitLab reports mergeable while
+        # the pipeline is still running: the merge gate is open but validation is
+        # not finished, and "CI running" is never DONE
+        return "WAIT", "pipeline_pending", f"pipeline {pipeline_status} (merge gate already mergeable)"
+    if detailed_merge == "mergeable" and pipeline_status not in SUCCESS_STATES and pipeline_status not in {"", "skipped"}:
+        # fail closed: a status in none of the tables (a value GitLab adds later,
+        # or a literal "unknown") is not evidence that CI passed, so a mergeable
+        # gate does not get to promote it to DONE
+        return "WAIT", "unknown", f"unrecognized pipeline status: {pipeline_status}"
+    if detailed_merge == "mergeable":
+        # authoritative once CI is neither running nor unrecognized: GitLab
+        # itself says this MR can merge right now, whether the pipeline was
+        # green, skipped, or never created. A green pipeline on its own never
+        # reaches this line.
+        return "DONE", "mergeable", "GitLab reports the MR mergeable"
+    if detailed_merge in GL_GATE_HUMAN:
+        return "WAIT", "human_gate", f"merge gate: {detailed_merge}"
+    if detailed_merge in GL_GATE_WAIT:
+        return "WAIT", "merge_gate_pending", f"merge gate: {detailed_merge}"
+    if pipeline_status in PENDING_STATES:
+        return "WAIT", "pipeline_pending", f"pipeline {pipeline_status}"
+    if detailed_merge:
+        return "WAIT", "unknown", f"unrecognized merge gate: {detailed_merge}"
+    # Legacy servers (<15.6) have no detailed_merge_status: can_be_merged only
+    # says the branches merge cleanly, not that approvals/CI/policies passed, so
+    # a green pipeline plus can_be_merged is still not the positive evidence
+    # DONE requires.
+    return "WAIT", "unknown", "no actionable failure in one-shot snapshot"
+
+
 def gitlab_snapshot(selector: str | None) -> dict[str, Any]:
     cmd = ["glab", "mr", "view"]
     if selector:
@@ -205,41 +351,21 @@ def gitlab_snapshot(selector: str | None) -> dict[str, Any]:
     merge_status = norm(first(data, "merge_status", "mergeStatus"))
     draft = bool(first(data, "draft", "work_in_progress", "workInProgress"))
 
-    # manual pipelines are terminal without a human; skipped ([ci skip], rules
-    # filtering) only blocks when the merge gate actually requires a pipeline
-    # ("ci_must_pass") or on legacy servers without detailed_merge_status ("",
-    # fail-safe). Other gate values (not_approved, checking, ...) keep their
-    # normal WAIT classification below.
-    actionable_pipeline = (
-        pipeline_status in FAIL_STATES
-        or pipeline_status == "manual"
-        or (pipeline_status == "skipped" and detailed_merge in {"", "ci_must_pass"})
-    )
+    conclusion, cause, reason = classify_gitlab(state, pipeline_status, detailed_merge, merge_status, draft)
+
+    # evidence list for the human-readable report; the decision above owns the
+    # conclusion, so the pipeline is only listed when the decision actually
+    # blamed it — a skipped pipeline on a mergeable MR is a DONE with no blocker,
+    # not "pipeline skipped". The raw status stays visible under "ci".
     blockers: list[str] = []
-    # most actionable first: reason/report use blockers[0]
-    if actionable_pipeline:
+    if cause in {"pipeline", "pipeline_pending"}:
         blockers.append(f"pipeline {pipeline_status}")
-    elif pipeline_status in PENDING_STATES:
-        blockers.append(f"pipeline {pipeline_status}")
-    if detailed_merge in {"conflict", "need_rebase"} or merge_status in {"cannot_be_merged", "cannot be merged"}:
+    if detailed_merge in GL_GATE_ACTION or merge_status in GL_LEGACY_MERGE_ACTION:
         blockers.append(f"merge state: {detailed_merge or merge_status}")
-    if detailed_merge in {"blocked_status", "checking", "unchecked", "ci_still_running", "not_approved", "discussions_not_resolved"}:
+    elif detailed_merge and detailed_merge != "mergeable":
         blockers.append(f"merge gate: {detailed_merge}")
     if draft:
         blockers.append("draft")
-
-    if state == "merged":
-        conclusion, reason = "DONE", "MR is merged"
-    elif state == "closed":
-        conclusion, reason = "DONE", "MR is closed"
-    elif actionable_pipeline or detailed_merge in {"conflict", "need_rebase"} or merge_status in {"cannot_be_merged", "cannot be merged"}:
-        conclusion, reason = "ACTION", blockers[0] if blockers else "actionable remote blocker"
-    elif pipeline_status in PENDING_STATES or draft or detailed_merge in {"blocked_status", "checking", "unchecked", "ci_still_running", "not_approved", "discussions_not_resolved"}:
-        conclusion, reason = "WAIT", blockers[0] if blockers else "remote gate is still pending"
-    elif pipeline_status in SUCCESS_STATES or detailed_merge == "mergeable":
-        conclusion, reason = "DONE", "pipeline is green or MR is mergeable"
-    else:
-        conclusion, reason = "WAIT", "no actionable failure in one-shot snapshot"
 
     return {
         "provider": "gitlab",

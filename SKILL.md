@@ -5,6 +5,8 @@ description: Token-efficient GitLab CI, GitHub Checks, MR, and PR status handlin
 
 # CI Status Snapshot
 
+`$SKILL_DIR` in every command below means this skill's install directory — the directory containing this `SKILL.md`. On Codex it defaults to `~/.codex/skills/ci-status-snapshot`; Claude Code reports the skill's base directory when the skill loads. Substitute the real path (or export `SKILL_DIR` once); never hardcode one install layout.
+
 ## Goal
 
 Use compact one-shot snapshots for immediate questions. When an active goal depends on pending CI or review, start the bundled local watcher in an attached deferred tool call. The script performs the polling without model turns and emits one compact event when state changes.
@@ -32,15 +34,15 @@ Interpret `WAIT` as "this CI-dependent step is paused." It is not a terminal Goa
 Use the bundled watcher after a snapshot is `WAIT` and later state matters to the active Goal:
 
 ```bash
-python3 ~/.codex/skills/ci-status-snapshot/scripts/ci_state_watch.py \
+python3 "$SKILL_DIR/scripts/ci_state_watch.py" \
   --provider github \
   --selector <pr-number-or-url> \
   --interval-seconds 30
 ```
 
-(On Claude Code hosts the same files are reachable at `~/.claude/skills/ci-status-snapshot/` — it is a symlink to the `~/.codex` install.)
+Use `--provider gitlab` for an MR. `--selector` is required: without it `gh`/`glab` resolve "the PR of the current branch" on every poll, so a checkout during the watch would silently retarget it. The default timeout is 7200 seconds as an orphan-process backstop; pass `--timeout-seconds 0` only when the surrounding runtime guarantees cleanup. The script takes its first `WAIT` read as a silent baseline and prints one JSON event only when the decision-relevant fingerprint changes; a first read that is already `ACTION`/`DONE` emits immediately.
 
-Use `--provider gitlab` for an MR. The default timeout is 7200 seconds as an orphan-process backstop; pass `--timeout-seconds 0` only when the surrounding runtime guarantees cleanup. The script takes its first `WAIT` read as a silent baseline and prints one JSON event only when the decision-relevant fingerprint changes; a first read that is already `ACTION`/`DONE` emits immediately.
+Watcher exit codes: `0` = one decision-relevant change (`event: change`), `2` = three consecutive snapshot errors (`event: error`), `3` = timeout backstop hit (`event: timeout`). Exactly one JSON event is printed in every case.
 
 Launch it through one deferred/attached tool invocation whose runtime can deliver a completion notification:
 
@@ -54,7 +56,7 @@ In either runtime it is not acceptable to resume the model periodically to call 
 Prefer the bundled snapshot helper when a one-shot status is enough:
 
 ```bash
-python3 ~/.codex/skills/ci-status-snapshot/scripts/ci_status_snapshot.py
+python3 "$SKILL_DIR/scripts/ci_status_snapshot.py"
 ```
 
 Use `--provider github` or `--provider gitlab` when auto-detection is wrong. Use `--selector <number|url|branch>` to check a specific PR/MR.
@@ -62,7 +64,7 @@ Use `--provider github` or `--provider gitlab` when auto-detection is wrong. Use
 Use the bundled GitLab auto-merge delegation helper when the user asks to inspect MR merge/CI delegation state:
 
 ```bash
-python3 ~/.codex/skills/ci-status-snapshot/scripts/ci_merge_delegate.py \
+python3 "$SKILL_DIR/scripts/ci_merge_delegate.py" \
   --provider gitlab \
   --selector <mr-iid-or-url> \
   --json
@@ -99,8 +101,8 @@ glab api "projects/<project_id>/merge_requests/<iid>" \
 Return one of three outcomes:
 
 - `ACTION`: failed or canceled CI, merge conflict, required manual job, rejected review, branch needs rebase/update, or a concrete blocker that can be fixed now.
-- `WAIT`: CI is running/pending/queued, review or approval is required, merge-when-pipeline-succeeds/auto-merge is enabled, or there is no actionable failure yet. Arm the local watcher when an active Goal depends on later state.
-- `DONE`: merged, closed intentionally, or all checks are green and no obvious remote blocker remains.
+- `WAIT`: CI is running/pending/queued, the PR/MR is still a draft, review or approval is required, merge-when-pipeline-succeeds/auto-merge is enabled, or there is no actionable failure yet. Arm the local watcher when an active Goal depends on later state.
+- `DONE`: merged, closed intentionally, or all checks are green and no obvious remote blocker remains. The helpers require positive merge evidence for that last case — GitHub `mergeStateStatus` `CLEAN`/`HAS_HOOKS`, GitLab `detailed_merge_status: mergeable`. A green pipeline alone is never `DONE`; a still-running pipeline stays `WAIT` even when the GitLab gate already reports `mergeable` (CI is not a required merge check there); and an unrecognized provider state is `WAIT`.
 
 For `ACTION`, fetch only the failed job logs needed for the next fix. Summarize the failing lines; do not paste full logs unless the user asks.
 
@@ -136,18 +138,20 @@ Do not wait for a running pipeline in model turns. Server-side auto-merge preser
 Use the bundled GitLab auto-merge delegation helper to confirm that merge is delegated to GitLab auto-merge or to surface an immediate terminal blocker:
 
 ```bash
-python3 ~/.codex/skills/ci-status-snapshot/scripts/ci_merge_delegate.py \
+python3 "$SKILL_DIR/scripts/ci_merge_delegate.py" \
   --provider gitlab \
   --selector <mr-iid-or-url> \
   --json
 ```
+
+Delegate exit codes: `0` = nothing to do now (`result` is `merged`, `delegated_auto_merge`, `waiting`, or `no_pipeline_observed`), `2` = terminal pipeline state, triage the failed jobs, `3` = a human must act (`closed_unmerged`, `merge_blocked`, `pipeline_success_unmerged`, `pipeline_skipped_mergeable`, `mergeable_unmerged`), `4` = `api_error`. Exit `0` does not mean merged — always read the `result` field. A `failed_jobs_error` field means the job list could not be fetched; it is not the same as zero failed jobs.
 
 The helper must:
 
 - Prefer non-blocking delegation after auto-merge is enabled: emit `delegated_auto_merge` and exit while CI is merely running/pending.
 - Print only compact JSON/text results. Do not print progress updates or state-change streams.
 - Exit after one snapshot unless it found an immediate terminal state.
-- Fetch failed job details only after a terminal failed/canceled/manual pipeline state, or a skipped pipeline whose merge gate still requires a pipeline; a skipped pipeline on a mergeable MR is not a failure.
+- Fetch failed job details only after a terminal failed/canceled/manual pipeline state, or a skipped pipeline whose merge gate is `ci_must_pass` (or a legacy server that reports no `detailed_merge_status` at all); a skipped pipeline under any other gate is not a failure.
 - Never be left running when sending the final answer.
 - If the helper cannot run, use the compact `glab api ... | jq` one-shot snapshot from the Snapshot First section. Do not replace the helper with a hand-written polling loop.
 
@@ -185,7 +189,7 @@ After a single-job retry, re-check the MR compact fields once. If auto-merge sta
 - Keep the watcher attached so its single exit event becomes a tool notification and it cannot become an orphan process.
 - Prefer provider-side auto-merge over local polling whenever possible.
 - Never fetch logs for successful, pending, or running jobs; skipped jobs have no useful trace — fetch metadata only.
-- If a pipeline reaches failed, canceled, or manual — or GitLab reports it skipped while the merge gate is not mergeable — stop status checks and switch to failed-job triage. GitHub check-level skipped/neutral conclusions are non-blocking and count as done.
+- If a pipeline reaches failed, canceled, or manual — or GitLab reports it skipped while the merge gate is `ci_must_pass` (or a legacy server reports no `detailed_merge_status` at all) — stop status checks and switch to failed-job triage. A skipped pipeline under any other gate (`mergeable`, `not_approved`, …) is not a failure. GitHub check-level skipped/neutral conclusions are non-blocking and count as done.
 - Prefer structured JSON fields over full command output.
 - Prefer local validation and focused fixes over waiting for remote reruns.
 - The agent re-checks remote state only after a code push, after enabling auto-merge, on a watcher notification, or when the user explicitly asks for a fresh snapshot.
@@ -193,6 +197,12 @@ After a single-job retry, re-check the MR compact fields once. If auto-merge sta
 - When the user says polling is wasting tokens, stop model-driven polling and move the wait into the silent local watcher.
 - When many MRs are open, process one mergeable MR at a time in dependency order. Do not refresh every MR after every merge unless the base branch changed in a way that can affect them.
 - Keep final reports compact: current conclusion, status evidence, and the next useful action.
+
+## Limitations
+
+- Provider auto-detection matches the literal strings `github`/`gitlab` in the `origin` URL, so self-hosted hosts (`git.example.com`) need an explicit `--provider`.
+- `ci_merge_delegate.py` runs `glab api` against the host `glab` infers from the repo remote; an MR URL selector on a different host is not routed there. Run it from a checkout of that project, or pass `--project`.
+- Legacy GitLab (before 15.6, no `detailed_merge_status`) never reports `DONE` from a green pipeline alone — the deprecated `merge_status` only proves the branches merge cleanly. Take a fresh snapshot after the merge, or upgrade the server.
 
 ## Response Shape
 
