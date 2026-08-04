@@ -60,14 +60,6 @@ ln -s "$PWD/skills/ci-status-snapshot" ~/.codex/skills/ci-status-snapshot
 ln -s "$PWD/skills/ci-status-snapshot" ~/.claude/skills/ci-status-snapshot
 ```
 
-### Upgrading a v0.1 manual install
-
-In v0.1 the skill lived at the repository root; v0.2 moved it to `skills/ci-status-snapshot/`. A v0.1-era copy or symlink of the repo root stops loading after `git pull` (no root `SKILL.md` anymore). Remove the old entry and reinstall — either through the plugin commands above, or by re-linking the new path:
-
-```bash
-rm -rf ~/.codex/skills/ci-status-snapshot   # or ~/.claude/skills/ci-status-snapshot
-```
-
 Do not keep a manual copy and the plugin install side by side — the skill would register twice.
 
 ## Requirements
