@@ -69,7 +69,7 @@ python3 -m pytest scripts -q
 
 ## Limitations
 
-Provider auto-detection matches the literal strings `github`/`gitlab` in the `origin` URL, so self-hosted hosts need an explicit `--provider`. `ci_merge_delegate.py` talks to the host `glab` infers from the repo remote, so an MR URL selector pointing at a different host is not routed there — run it from a checkout of that project or pass `--project`. GitLab servers older than 15.6 have no `detailed_merge_status`, and the deprecated `merge_status` only proves the branches merge cleanly, so those MRs never reach `DONE` from a green pipeline; snapshot again after the merge, or upgrade the server.
+Provider auto-detection matches the literal strings `github`/`gitlab` in the `origin` URL, so self-hosted hosts need an explicit `--provider`. `ci_merge_delegate.py` talks to the host `glab` infers from the repo remote and never passes `--hostname`, so an MR URL selector pointing at a different host is not routed there: `--project` only changes the project path, which can read the same IID off the wrong instance. Run the helper from a checkout of that host's project. GitLab servers older than 15.6 have no `detailed_merge_status`, and the deprecated `merge_status` only proves the branches merge cleanly, so those MRs never reach `DONE` from a green pipeline; snapshot again after the merge, or upgrade the server.
 
 ## License
 

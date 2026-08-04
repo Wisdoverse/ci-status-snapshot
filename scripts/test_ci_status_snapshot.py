@@ -159,10 +159,22 @@ def test_gitlab_mergeable_is_done_once_ci_is_not_running() -> None:
         assert snap["conclusion"] == "DONE", (pipeline, snap)
 
 
-def test_gitlab_mergeable_with_unrecognized_pipeline_waits() -> None:
-    # fail closed: a status outside every table is not evidence CI passed
-    snap = gl(pipeline="totally_new_state", gate="mergeable")
-    assert snap["conclusion"] == "WAIT" and "totally_new_state" in snap["reason"], snap
+def test_gitlab_unrecognized_pipeline_status_waits() -> None:
+    # fail closed: a status outside every table is not evidence CI passed, and
+    # no gate — mergeable or still settling — may outrank it
+    for gate in ["mergeable", "checking", "ci_still_running", ""]:
+        snap = gl(pipeline="weird_new_state", gate=gate)
+        assert snap["conclusion"] == "WAIT" and "weird_new_state" in snap["reason"], (gate, snap)
+    named = gl(pipeline="totally_new_state", gate="mergeable")
+    assert "totally_new_state" in named["reason"], named
+
+
+def test_gitlab_human_gate_survives_an_unknown_pipeline_status() -> None:
+    # unknown blocks optimistic outcomes only: a known approval/discussion gate
+    # is pipeline-independent and must still be reported as the blocker
+    for gate in ["not_approved", "discussions_not_resolved", "merge_request_blocked", "blocked_status"]:
+        snap = gl(pipeline="weird_new_state", gate=gate)
+        assert snap["conclusion"] == "WAIT" and snap["reason"] == f"merge gate: {gate}", (gate, snap)
 
 
 def test_gitlab_mergeable_with_running_pipeline_waits() -> None:
@@ -260,9 +272,12 @@ def test_gitlab_legacy_merge_status() -> None:
 
 
 def test_gitlab_terminal_states_are_done() -> None:
+    # merged/closed MRs still report gate "not_open": DONE must carry no blockers
     for state in ["merged", "closed"]:
         snap = gl(pipeline="failed", gate="not_open", state=state)
-        assert snap["conclusion"] == "DONE", (state, snap)
+        assert snap["conclusion"] == "DONE" and snap["blockers"] == [], (state, snap)
+    stale = gl(pipeline="success", gate="not_open", state="merged", draft=True)
+    assert stale["conclusion"] == "DONE" and stale["blockers"] == [], stale
 
 
 def test_gitlab_unrecognized_gate_waits() -> None:

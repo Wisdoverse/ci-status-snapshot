@@ -300,15 +300,22 @@ def classify_gitlab(
         # change, say), so draft outranks every DONE path — but not a red
         # pipeline, which stays actionable on a draft like anywhere else
         return "WAIT", "draft", "draft"
+    if detailed_merge in GL_GATE_HUMAN:
+        # above the unknown-status fallback: an approval/discussion gate is
+        # pipeline-independent evidence, and hiding it behind "we cannot read the
+        # pipeline" would lose a real blocker
+        return "WAIT", "human_gate", f"merge gate: {detailed_merge}"
     if detailed_merge == "mergeable" and pipeline_status in PENDING_STATES:
         # where CI is not a required merge check, GitLab reports mergeable while
         # the pipeline is still running: the merge gate is open but validation is
         # not finished, and "CI running" is never DONE
         return "WAIT", "pipeline_pending", f"pipeline {pipeline_status} (merge gate already mergeable)"
-    if detailed_merge == "mergeable" and pipeline_status not in SUCCESS_STATES and pipeline_status not in {"", "skipped"}:
+    if pipeline_status and pipeline_status not in SUCCESS_STATES and pipeline_status not in PENDING_STATES and pipeline_status != "skipped":
         # fail closed: a status in none of the tables (a value GitLab adds later,
-        # or a literal "unknown") is not evidence that CI passed, so a mergeable
-        # gate does not get to promote it to DONE
+        # or a literal "unknown") is not evidence that CI passed. Unknown blocks
+        # OPTIMISTIC outcomes, never negative ones — a mergeable gate may not
+        # promote it to DONE and a settling gate may not let the delegate call it
+        # delegated, but a known human gate above still reports its own blocker.
         return "WAIT", "unknown", f"unrecognized pipeline status: {pipeline_status}"
     if detailed_merge == "mergeable":
         # authoritative once CI is neither running nor unrecognized: GitLab
@@ -316,8 +323,6 @@ def classify_gitlab(
         # green, skipped, or never created. A green pipeline on its own never
         # reaches this line.
         return "DONE", "mergeable", "GitLab reports the MR mergeable"
-    if detailed_merge in GL_GATE_HUMAN:
-        return "WAIT", "human_gate", f"merge gate: {detailed_merge}"
     if detailed_merge in GL_GATE_WAIT:
         return "WAIT", "merge_gate_pending", f"merge gate: {detailed_merge}"
     if pipeline_status in PENDING_STATES:
@@ -360,12 +365,16 @@ def gitlab_snapshot(selector: str | None) -> dict[str, Any]:
     blockers: list[str] = []
     if cause in {"pipeline", "pipeline_pending"}:
         blockers.append(f"pipeline {pipeline_status}")
-    if detailed_merge in GL_GATE_ACTION or merge_status in GL_LEGACY_MERGE_ACTION:
-        blockers.append(f"merge state: {detailed_merge or merge_status}")
-    elif detailed_merge and detailed_merge != "mergeable":
-        blockers.append(f"merge gate: {detailed_merge}")
-    if draft:
-        blockers.append("draft")
+    if conclusion != "DONE":
+        # a DONE MR has no blockers by definition: merged/closed MRs still report
+        # detailed_merge_status "not_open" and can carry a stale draft flag, and
+        # listing either would contradict the conclusion
+        if detailed_merge in GL_GATE_ACTION or merge_status in GL_LEGACY_MERGE_ACTION:
+            blockers.append(f"merge state: {detailed_merge or merge_status}")
+        elif detailed_merge and detailed_merge != "mergeable":
+            blockers.append(f"merge gate: {detailed_merge}")
+        if draft:
+            blockers.append("draft")
 
     return {
         "provider": "gitlab",

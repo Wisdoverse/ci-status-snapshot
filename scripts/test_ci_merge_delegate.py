@@ -47,6 +47,9 @@ def write_glab_stub(directory: Path) -> None:
                 sys.exit(0)
 
             if "merge_requests/396" in path:
+                if mode == "html_response":
+                    print("<html>login</html>")
+                    sys.exit(0)
                 if mode == "skipped_not_approved":
                     mr("skipped", "not_approved")
                 if mode == "skipped_ci_must_pass":
@@ -57,6 +60,14 @@ def write_glab_stub(directory: Path) -> None:
                     mr("running", "mergeable")
                 if mode == "unknown_status_auto_merge":
                     mr("totally_new_state", "mergeable", merge_when_pipeline_succeeds=True)
+                if mode == "literal_unknown_status_auto_merge":
+                    mr("unknown", "mergeable", merge_when_pipeline_succeeds=True)
+                if mode == "weird_status_settling_gate_auto_merge":
+                    mr("weird_new_state", "checking", merge_when_pipeline_succeeds=True)
+                if mode == "weird_status_human_gate_auto_merge":
+                    mr("weird_new_state", "not_approved", merge_when_pipeline_succeeds=True)
+                if mode == "draft_no_pipeline":
+                    mr(None, "unchecked", draft=True)
                 if mode == "bare_running_auto_merge":
                     mr("running", "", merge_when_pipeline_succeeds=True)
                 if mode == "draft_auto_merge_running":
@@ -251,6 +262,46 @@ def test_unrecognized_pipeline_status_is_not_delegated() -> None:
     assert proc.returncode == 0, proc.stderr or proc.stdout
     payload = json.loads(proc.stdout)
     assert payload["result"] == "waiting", payload
+
+
+def test_non_json_response_is_an_api_error() -> None:
+    # glab exiting 0 with a proxy/login page must stay inside the 0/2/3/4 contract
+    proc = run_snapshot("html_response")
+    assert proc.returncode == 4, proc.stderr or proc.stdout
+    payload = json.loads(proc.stdout)
+    assert payload["result"] == "api_error" and payload["last_error"], payload
+
+
+def test_literal_unknown_pipeline_status_is_not_delegated() -> None:
+    # a head pipeline that exists and reports "unknown" is not an absent
+    # pipeline: it must fail closed, not ride the mergeable gate to delegation
+    proc = run_snapshot("literal_unknown_status_auto_merge")
+    assert proc.returncode == 0, proc.stderr or proc.stdout
+    payload = json.loads(proc.stdout)
+    assert payload["result"] == "waiting", payload
+
+
+def test_unrecognized_status_behind_settling_gate_is_not_delegated() -> None:
+    # the settling gate must not outrank a pipeline status we cannot classify
+    proc = run_snapshot("weird_status_settling_gate_auto_merge")
+    assert proc.returncode == 0, proc.stderr or proc.stdout
+    payload = json.loads(proc.stdout)
+    assert payload["result"] == "waiting", payload
+
+
+def test_unrecognized_status_behind_human_gate_is_still_blocked() -> None:
+    # the other direction: an unreadable pipeline must not hide the approval gate
+    proc = run_snapshot("weird_status_human_gate_auto_merge")
+    assert proc.returncode == 3, proc.stderr or proc.stdout
+    payload = json.loads(proc.stdout)
+    assert payload["result"] == "merge_blocked", payload
+
+
+def test_draft_without_pipeline_reports_the_draft() -> None:
+    proc = run_snapshot("draft_no_pipeline")
+    assert proc.returncode == 0, proc.stderr or proc.stdout
+    payload = json.loads(proc.stdout)
+    assert payload["result"] == "waiting" and payload["draft"] is True, payload
 
 
 def test_draft_with_auto_merge_is_not_delegated() -> None:

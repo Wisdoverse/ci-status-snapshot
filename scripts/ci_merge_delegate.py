@@ -170,6 +170,7 @@ def base_result(result: str, project: str, mr: str, data: dict[str, Any]) -> dic
         "sha": data.get("sha"),
         "merge_status": first(data, "detailed_merge_status", "detailedMergeStatus", "merge_status", "mergeStatus"),
         "auto_merge": bool(first(data, "merge_when_pipeline_succeeds", "mergeWhenPipelineSucceeds")),
+        "draft": bool(first(data, "draft", "work_in_progress", "workInProgress")),
         "pipeline_id": first(pipeline, "id", "iid"),
         "pipeline_status": first(pipeline, "status", "detailedStatus", "detailed_status") or "unknown",
         "web_url": first(data, "web_url", "webUrl", "url"),
@@ -189,7 +190,12 @@ def print_result(payload: dict[str, Any], as_json: bool) -> None:
 
 def supervise_gitlab_mr(args: argparse.Namespace) -> int:
     project, mr = resolve_project_and_mr(args.project, args.selector)
-    code, data, err = glab_api(f"projects/{project_api_id(project)}/merge_requests/{mr}")
+    try:
+        code, data, err = glab_api(f"projects/{project_api_id(project)}/merge_requests/{mr}")
+    except SystemExit as exc:
+        # glab can exit 0 and print a proxy/login page instead of JSON; that is an
+        # api_error like any other, not a bare exit 1 outside the 0/2/3/4 contract
+        code, data, err = 1, None, str(exc)
     if code != 0 or not isinstance(data, dict):
         print_result(
             {
@@ -205,18 +211,19 @@ def supervise_gitlab_mr(args: argparse.Namespace) -> int:
         return 4
 
     result = base_result("", project, mr, data)
-    # base_result reports "unknown" when the MR carries no head pipeline (or one
-    # with no status): either way there is no pipeline state to classify
-    pipeline_status = norm(result["pipeline_status"])
-    no_pipeline = pipeline_status == "unknown"
-    if no_pipeline:
-        pipeline_status = ""
+    # absence is a property of the pipeline object, never of its status string:
+    # base_result displays "unknown" for both a missing pipeline and a pipeline
+    # that reports a literal "unknown" status, and those must not classify alike.
+    # Missing -> "" (no CI to judge); present -> the literal status, which
+    # classify_gitlab fail-closes if it recognizes none of its tables.
+    no_pipeline = result["pipeline_id"] in (None, "")
+    pipeline_status = "" if no_pipeline else norm(result["pipeline_status"])
     _conclusion, cause, _reason = classify_gitlab(
         norm(data.get("state")),
         pipeline_status,
         norm(first(data, "detailed_merge_status", "detailedMergeStatus")),
         norm(first(data, "merge_status", "mergeStatus")),
-        bool(first(data, "draft", "work_in_progress", "workInProgress")),
+        result["draft"],
     )
 
     if cause == "merged":
@@ -267,6 +274,13 @@ def supervise_gitlab_mr(args: argparse.Namespace) -> int:
             result["result"] = "mergeable_unmerged"
         print_result(result, args.json)
         return 3
+
+    if cause == "draft":
+        # before the no-pipeline branch on purpose: a draft with no pipeline is
+        # blocked by the draft, and reporting "no pipeline observed" would hide it
+        result["result"] = "waiting"
+        print_result(result, args.json)
+        return 0
 
     if no_pipeline:
         # not the same as waiting for CI: an MR with no head pipeline may still

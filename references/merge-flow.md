@@ -35,7 +35,7 @@ The helper must:
 
 ## GitLab caveats
 
-- `ci_merge_delegate.py` runs `glab api` against the host `glab` infers from the repo remote; an MR URL selector on a different host is not routed there. Run it from a checkout of that project, or pass `--project`.
+- `ci_merge_delegate.py` runs `glab api` against the host `glab` infers from the repo remote and never passes `--hostname`. An MR URL selector for a different host is not routed there, and `--project` does not fix it — it only changes the project path, so the same IID can be read off the wrong instance (or 404). Run the helper from a checkout of that host's project. `--project` is for project inference within the right host.
 - Legacy GitLab (before 15.6, no `detailed_merge_status`) never reports `DONE` from a green pipeline alone — the deprecated `merge_status` only proves the branches merge cleanly. Take a fresh snapshot after the merge, or upgrade the server.
 
 ## Compact MR field snapshot
