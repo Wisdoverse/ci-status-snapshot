@@ -21,6 +21,6 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       # no install step on purpose: zero dependencies is part of the contract
-      - run: python3 scripts/test_ci_status_snapshot.py
-      - run: python3 scripts/test_ci_state_watch.py
-      - run: python3 scripts/test_ci_merge_delegate.py
+      - run: python3 skills/ci-status-snapshot/scripts/test_ci_status_snapshot.py
+      - run: python3 skills/ci-status-snapshot/scripts/test_ci_state_watch.py
+      - run: python3 skills/ci-status-snapshot/scripts/test_ci_merge_delegate.py

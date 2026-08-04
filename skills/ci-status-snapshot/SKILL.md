@@ -5,7 +5,7 @@ description: Token-efficient GitLab CI, GitHub Checks, MR, and PR status handlin
 
 # CI Status Snapshot
 
-`$SKILL_DIR` means this skill's install directory — the one holding this `SKILL.md` (Codex default `~/.codex/skills/ci-status-snapshot`; Claude Code reports the base directory when the skill loads). Substitute it or export it once; never hardcode an install layout.
+`$SKILL_DIR` means this skill's install directory — the one holding this `SKILL.md`. Installed as a plugin it is the host's plugin cache directory, which Claude Code and Codex report when the skill loads; copied manually it is `~/.claude/skills/ci-status-snapshot` or `~/.codex/skills/ci-status-snapshot`. Substitute it or export it once; never hardcode an install layout.
 
 This file is the always-loaded contract. Two playbooks stay unloaded until their trigger fires: `$SKILL_DIR/references/gitlab-triage.md` (failed/stuck GitLab jobs) and `$SKILL_DIR/references/merge-flow.md` (merge and auto-merge delegation).
 

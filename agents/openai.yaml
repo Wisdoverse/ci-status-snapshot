@@ -1,4 +1,0 @@
-interface:
-  display_name: "CI Status Snapshot"
-  short_description: "CI snapshots with token-free state notifications"
-  default_prompt: "Use $ci-status-snapshot to inspect CI once, keep my Goal active, and delegate any continued polling to the silent local watcher."

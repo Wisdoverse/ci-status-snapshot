@@ -1,0 +1,13 @@
+{
+  "name": "ci-status-snapshot",
+  "version": "0.2.0",
+  "description": "Token-efficient GitLab CI, GitHub Checks, MR, and PR status handling: one-shot snapshots, a silent local watcher that notifies only on state change, and GitLab auto-merge delegation.",
+  "author": {
+    "name": "Wisdoverse",
+    "url": "https://github.com/Wisdoverse"
+  },
+  "homepage": "https://github.com/Wisdoverse/ci-status-snapshot",
+  "repository": "https://github.com/Wisdoverse/ci-status-snapshot",
+  "license": "Apache-2.0",
+  "keywords": ["ci", "gitlab", "github", "auto-merge", "token-efficiency"]
+}

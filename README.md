@@ -6,7 +6,7 @@ An agent skill for reading CI/PR/MR state cheaply. Coding agents burn tokens re-
 - a silent local watcher that polls without model turns and prints exactly one JSON event when the state actually changes,
 - a GitLab auto-merge delegation snapshot that confirms the merge is server-side delegated, or names the blocker.
 
-`SKILL.md` is the agent-facing contract that Codex and Claude Code load on every trigger; it stays lean on purpose. The deeper playbooks — `references/gitlab-triage.md` (failed/stuck GitLab jobs) and `references/merge-flow.md` (merge and auto-merge delegation) — are read on demand, only when their trigger condition is met. This README is for humans.
+Everything lives under `skills/ci-status-snapshot/`: `SKILL.md` is the agent-facing contract that Codex and Claude Code load on every trigger, and it stays lean on purpose. The deeper playbooks — `references/gitlab-triage.md` (failed/stuck GitLab jobs) and `references/merge-flow.md` (merge and auto-merge delegation) — are read on demand, only when their trigger condition is met. This README is for humans.
 
 ## The contract
 
@@ -20,16 +20,55 @@ An agent skill for reading CI/PR/MR state cheaply. Coding agents burn tokens re-
 
 ## Install
 
-Copy or symlink this repository into the host's skills directory:
+The repository is its own plugin marketplace, so both hosts install it in two commands.
+
+### Claude Code
+
+```
+/plugin marketplace add Wisdoverse/ci-status-snapshot
+```
+```
+/plugin install ci-status-snapshot@ci-status-snapshot
+```
+
+(Send the two `/plugin` commands as separate prompts.)
+
+### Codex
+
+```bash
+codex plugin marketplace add Wisdoverse/ci-status-snapshot
+codex plugin add ci-status-snapshot@ci-status-snapshot
+```
+
+Start a new thread afterwards so the skill is picked up. There are no hooks to trust — the plugin ships instructions and three stdlib-only scripts, nothing that runs on its own.
+
+### Uninstall
+
+| Host | Command |
+| --- | --- |
+| Claude Code | `/plugin uninstall ci-status-snapshot@ci-status-snapshot` |
+| Codex | `codex plugin remove ci-status-snapshot@ci-status-snapshot` |
+
+### Manual copy (fallback)
+
+Without the plugin system, copy or symlink the skill directory into the host's skills directory:
 
 ```bash
 # Codex
-ln -s "$PWD" ~/.codex/skills/ci-status-snapshot
+ln -s "$PWD/skills/ci-status-snapshot" ~/.codex/skills/ci-status-snapshot
 # Claude Code
-ln -s "$PWD" ~/.claude/skills/ci-status-snapshot
+ln -s "$PWD/skills/ci-status-snapshot" ~/.claude/skills/ci-status-snapshot
 ```
 
-`agents/openai.yaml` is the Codex interface manifest (display name and default prompt).
+### Upgrading a v0.1 manual install
+
+In v0.1 the skill lived at the repository root; v0.2 moved it to `skills/ci-status-snapshot/`. A v0.1-era copy or symlink of the repo root stops loading after `git pull` (no root `SKILL.md` anymore). Remove the old entry and reinstall — either through the plugin commands above, or by re-linking the new path:
+
+```bash
+rm -rf ~/.codex/skills/ci-status-snapshot   # or ~/.claude/skills/ci-status-snapshot
+```
+
+Do not keep a manual copy and the plugin install side by side — the skill would register twice.
 
 ## Requirements
 
@@ -38,7 +77,11 @@ ln -s "$PWD" ~/.claude/skills/ci-status-snapshot
 
 ## Usage
 
+Paths below are relative to the repo; installed as a plugin, use the skill directory the host reports.
+
 ```bash
+cd skills/ci-status-snapshot
+
 # One-shot snapshot (provider auto-detected from the git remote)
 python3 scripts/ci_status_snapshot.py --selector 123
 python3 scripts/ci_status_snapshot.py --provider gitlab --selector 396 --json
@@ -60,11 +103,11 @@ The watcher requires `--selector`: without it `gh`/`glab` resolve "the PR of the
 No test framework required; each file runs standalone and is also collectible by pytest.
 
 ```bash
-python3 scripts/test_ci_status_snapshot.py
-python3 scripts/test_ci_state_watch.py
-python3 scripts/test_ci_merge_delegate.py
+python3 skills/ci-status-snapshot/scripts/test_ci_status_snapshot.py
+python3 skills/ci-status-snapshot/scripts/test_ci_state_watch.py
+python3 skills/ci-status-snapshot/scripts/test_ci_merge_delegate.py
 
-python3 -m pytest scripts -q
+python3 -m pytest skills/ci-status-snapshot/scripts -q
 ```
 
 ## Limitations

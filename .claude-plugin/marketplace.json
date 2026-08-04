@@ -1,0 +1,17 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "ci-status-snapshot",
+  "description": "Token-efficient CI/PR/MR status for coding agents: one-shot snapshots, a silent watcher, and GitLab auto-merge delegation.",
+  "owner": {
+    "name": "Wisdoverse",
+    "url": "https://github.com/Wisdoverse"
+  },
+  "plugins": [
+    {
+      "name": "ci-status-snapshot",
+      "description": "Read CI, PR, and MR state in one bounded call and wait without model turns. ACTION / WAIT / DONE, never optimistic on unknown state.",
+      "source": "./",
+      "category": "productivity"
+    }
+  ]
+}
