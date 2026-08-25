@@ -21,13 +21,38 @@ def take_snapshot(provider: str, selector: str) -> dict[str, Any]:
     return github_snapshot(selector) if resolved == "github" else gitlab_snapshot(selector)
 
 
-def fingerprint(snapshot: dict[str, Any]) -> str:
+# Merge-gate values that describe the MACHINE still working, not a decision
+# anyone made: GitLab's detailed_merge_status while pipelines/approval sync
+# churn, and GitHub's transient UNKNOWN. A busy repository flaps between these
+# every time its target branch moves — six merges produced nine such wake-ups
+# in one observed session, each burning the model turn this watcher exists to
+# save. They are folded into the last SOLID gate value for fingerprinting, so
+# flapping among them is silence while a real gate move (approval landing,
+# BLOCKED -> CLEAN, conflicts) still wakes.
+TRANSIENT_MERGE_STATES = frozenset({
+    "checking",
+    "ci_still_running",
+    "approvals_syncing",
+    "unchecked",
+    "preparing",
+    "unknown",
+    "",
+})
+
+
+def is_transient_merge_state(value: Any) -> bool:
+    return value is None or (isinstance(value, str) and value.lower() in TRANSIENT_MERGE_STATES)
+
+
+def fingerprint(snapshot: dict[str, Any], solid_merge_state: Any) -> str:
     # Only decision-relevant fields: conclusion flips (WAIT->ACTION/DONE), a new
     # push, human gates moving (review decision on GitHub — GitLab surfaces
     # approvals via merge_state — draft toggle, merge gate), or someone
     # disabling delegated auto-merge. Per-check progress (ci counts,
     # pending_checks) is deliberately excluded — waking the agent on every
-    # completed check degrades into slow polling.
+    # completed check degrades into slow polling — and so are transient
+    # merge-gate states, which carry the last solid value instead (see
+    # TRANSIENT_MERGE_STATES).
     stable = {
         "provider": snapshot.get("provider"),
         "number": snapshot.get("number"),
@@ -35,7 +60,7 @@ def fingerprint(snapshot: dict[str, Any]) -> str:
         "state": snapshot.get("state"),
         "head_sha": snapshot.get("head_sha"),
         "review": snapshot.get("review"),
-        "merge_state": snapshot.get("merge_state"),
+        "merge_state": solid_merge_state,
         "draft": snapshot.get("draft"),
         "auto_merge": snapshot.get("auto_merge"),
     }
@@ -52,6 +77,7 @@ def watch(
 ) -> tuple[dict[str, Any], int]:
     started = monotonic_fn()
     baseline: str | None = None
+    solid_merge_state: Any = None
     errors = 0
     total_errors = 0
     last_error = ""
@@ -59,7 +85,9 @@ def watch(
     while True:
         try:
             current = snapshot_fn()
-            current_fingerprint = fingerprint(current)
+            if not is_transient_merge_state(current.get("merge_state")):
+                solid_merge_state = current.get("merge_state")
+            current_fingerprint = fingerprint(current, solid_merge_state)
             errors = 0
             last_error = ""
             if baseline is None:

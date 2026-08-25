@@ -166,6 +166,54 @@ def test_unexpected_exceptions_are_counted() -> None:
     assert event["event"] == "error"
     assert event["error"] == "no exec"
 
+def test_transient_gate_churn_stays_silent() -> None:
+    # A busy target branch flaps the GitLab gate mergeable -> checking ->
+    # ci_still_running -> mergeable on every sibling merge, all while the
+    # conclusion stays WAIT. None of that is a decision; waking on it degrades
+    # into one model turn per sibling merge (observed: nine wake-ups across six
+    # merges in one session).
+    def gated(state: str, conclusion: str = "WAIT") -> dict[str, object]:
+        s = snapshot(conclusion, 1 if conclusion == "WAIT" else 0)
+        s["merge_state"] = state
+        return s
+
+    states = iter([
+        gated("ci_still_running"),
+        gated("checking"),
+        gated("approvals_syncing"),
+        gated("mergeable"),           # first solid while CI still runs: wakes (approval evidence)
+    ])
+    event, exit_code = watch(lambda: next(states), 0, 3, 0, sleep_fn=lambda _: None)
+    assert exit_code == 0
+    assert event["current"]["merge_state"] == "mergeable"
+
+    # Once a solid value is known, flapping back through transients and
+    # returning to the SAME solid value must not wake; only the terminal
+    # conclusion does.
+    states = iter([
+        gated("mergeable"),
+        gated("checking"),
+        gated("ci_still_running"),
+        gated("mergeable"),
+        gated("checking"),
+        gated("mergeable", "DONE"),
+    ])
+    event, exit_code = watch(lambda: next(states), 0, 3, 0, sleep_fn=lambda _: None)
+    assert exit_code == 0
+    assert event["current"]["conclusion"] == "DONE"
+
+    # A SOLID gate move through a transient window still wakes: an approval
+    # landing (not_approved -> mergeable) is a decision even mid-churn.
+    states = iter([
+        gated("not_approved"),
+        gated("checking"),
+        gated("mergeable"),
+    ])
+    event, exit_code = watch(lambda: next(states), 0, 3, 0, sleep_fn=lambda _: None)
+    assert exit_code == 0
+    assert event["current"]["merge_state"] == "mergeable"
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):
