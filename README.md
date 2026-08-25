@@ -36,11 +36,21 @@ The repository is its own plugin marketplace, so both hosts install it in two co
 ### Codex
 
 ```bash
-codex plugin marketplace add Wisdoverse/ci-status-snapshot
+codex plugin marketplace add https://github.com/Wisdoverse/ci-status-snapshot.git
 codex plugin add ci-status-snapshot@ci-status-snapshot
 ```
 
 Start a new thread afterwards so the skill is picked up. There are no hooks to trust — the plugin ships instructions and three stdlib-only scripts, nothing that runs on its own.
+
+If `marketplace add` reports that `ci-status-snapshot` is already added from a different source, the local Codex registration is stale or was created with another spelling of the same Git URL. Remove only that marketplace entry, then recreate it with the canonical URL:
+
+```bash
+codex plugin marketplace remove ci-status-snapshot
+codex plugin marketplace add https://github.com/Wisdoverse/ci-status-snapshot.git
+codex plugin add ci-status-snapshot@ci-status-snapshot
+```
+
+Do not remove the marketplace for other installation errors; inspect the reported error first.
 
 ### Uninstall
 
