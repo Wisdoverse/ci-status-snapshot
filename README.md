@@ -90,7 +90,7 @@ python3 scripts/ci_status_snapshot.py --provider gitlab --selector 396 --json
 
 # Silent watcher: one JSON event on the first decision-relevant change
 # exit 0 = change, 2 = three consecutive errors, 3 = timeout backstop
-python3 scripts/ci_state_watch.py --provider github --selector 123 --interval-seconds 30
+python3 scripts/ci_state_watch.py --provider github --selector 123 --expected-head <full-head-sha> --interval-seconds 30
 
 # GitLab auto-merge delegation snapshot (never blocks)
 # exit 0 = merged/delegated_auto_merge/waiting/no_pipeline_observed, 2 = pipeline
@@ -99,6 +99,13 @@ python3 scripts/ci_merge_delegate.py --provider gitlab --selector 396 --json
 ```
 
 The watcher requires `--selector`: without it `gh`/`glab` resolve "the PR of the current branch" on every poll, so a checkout mid-watch would silently retarget it.
+
+Pass the previous snapshot's full SHA as `--expected-head` to catch a push before
+the watcher's first read, even if CI is still pending. Without a prior snapshot,
+omit it. Error/timeout events include the target and a timestamped `last_snapshot`
+when available; that is stale context, not fresh CI evidence. The default timeout
+is a finite 7200 seconds. Existing watchers keep their original code until they
+exit; updating the skill does not restart them.
 
 ## Tests
 

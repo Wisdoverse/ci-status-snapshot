@@ -18,12 +18,14 @@ Use compact one-shot snapshots for immediate questions. When an active goal depe
 The authoritative rule list. Everything below is binding.
 
 - Hard rule: the agent never runs the polling loop. No repeated tool calls or assistant turns, `--watch` commands that stream progress into chat, scheduled goal turns or continuations, subagents, reminders, terminal streams, status narration, or manual "check again" cycles. A deterministic local script may poll while the model is idle, provided it stays silent and the attached tool runtime sends exactly one completion notification.
-- Use each one-shot helper once per decision point. Start at most one watcher per PR/MR head; it exits on the first decision-relevant change.
+- Choose one one-shot helper per decision point: snapshot for status, delegate for GitLab merge intent. Do not chain both over unchanged state. A mutation response with the needed fields already counts as fresh evidence. Start at most one watcher per repository + PR/MR + head; retain its tool handle across context handoffs.
 - Treat `WAIT` and `delegated_auto_merge` as watcher-arm outcomes when an active Goal depends on later state. Prefer provider-side auto-merge over local polling whenever possible.
 - Run only `scripts/ci_state_watch.py` for local waiting. Keep it attached to a deferred tool call so its single exit event becomes a tool notification and it cannot become an orphan process; do not use `nohup`, `&`, detached terminal sessions, or polling subagents.
-- The watcher baselines its first `WAIT` read and stays silent until the decision-relevant fingerprint (conclusion, head SHA, PR/MR state, GitHub review decision — GitLab approvals surface via the merge gate — draft flag, merge gate, auto-merge flag) changes, then exits with one JSON event; also on three consecutive errors or timeout. Transient merge-gate values (`checking`, `ci_still_running`, `approvals_syncing`, `unchecked`, `preparing`, `unknown`) carry the last solid gate value in the fingerprint, so a busy target branch flapping the gate on every sibling merge is silence, while a real gate move (an approval landing, `BLOCKED`→`CLEAN`, conflicts) still wakes. A first read that is already `ACTION`/`DONE` (state moved between snapshot and arm) emits immediately with `"initial": true` instead of hanging on a terminal baseline.
+- Pass `--expected-head` with the full SHA from the handoff snapshot (`head_sha`, or delegate `sha`). The first read emits immediately if that head changed even when it is still `WAIT`, or if the state is already `ACTION`/`DONE`. Without a prior snapshot, the argument is optional and the first `WAIT` becomes the baseline.
+- The watcher stays silent until a decision-relevant fingerprint changes: conclusion, head, PR/MR state, review gate, draft or auto-merge. Per-job progress and transient merge-gate churn do not wake the model. It also exits after three consecutive errors or timeout; these are watcher failures, not CI failures.
 - After the tool yields control, do not call `wait`, `write_stdin`, poll methods, or another snapshot command to inspect it. Continue useful work and consume the runtime's completion notification when it arrives.
 - Treat `event.current` in that notification as the fresh snapshot; do not immediately query the same state again. Re-read only when an exact-head mutation such as merge requires it.
+- Error/timeout events identify the target in `watch` and preserve a timestamped `last_snapshot` when available. That observation is stale context, not `current`. Diagnose the reported failure once; if resolved and the Goal still needs this target, re-arm one watcher. Do not auto-retry indefinitely, create a second watcher, or silently leave the Goal with no event source.
 - Re-check remote state only after a code push, after enabling auto-merge, on a watcher notification, or when the user explicitly asks for a fresh snapshot — and a fresh snapshot is one bounded read, not permission to keep watching.
 - Never end, complete, or block an unfinished Goal merely because CI/review is `WAIT`. `WAIT` means this CI-dependent step is paused: continue independent Goal work, and if none remains keep the Goal active and let the watcher notification resume it.
 - When the user says polling is wasting tokens, stop model-driven polling and move the wait into the silent local watcher.
@@ -34,10 +36,11 @@ The authoritative rule list. Everything below is binding.
 python3 "$SKILL_DIR/scripts/ci_state_watch.py" \
   --provider github \
   --selector <pr-number-or-url> \
+  --expected-head <full-sha-from-snapshot> \
   --interval-seconds 30
 ```
 
-Use `--provider gitlab` for an MR. `--selector` is required: without it `gh`/`glab` resolve "the PR of the current branch" on every poll, so a checkout during the watch would silently retarget it. The default timeout is 7200 seconds as an orphan-process backstop; pass `--timeout-seconds 0` only when the surrounding runtime guarantees cleanup.
+Use `--provider gitlab` for an MR, from that repository's checkout. `--selector` is required: without it a checkout change could retarget the watch. Omitting `--timeout-seconds` means a finite **7200 seconds**, not an infinite wait; only explicit `0` disables the backstop, and requires guaranteed runtime cleanup. Keep the existing 30-second cadence unless there is measured reason to change it.
 
 Watcher exit codes: `0` = one decision-relevant change (`event: change`), `2` = three consecutive snapshot errors (`event: error`), `3` = timeout backstop hit (`event: timeout`). Exactly one JSON event is printed in every case.
 
@@ -84,6 +87,8 @@ Return one of three outcomes:
 - `ACTION`: failed or canceled CI, merge conflict, required manual job, rejected review, branch needs rebase/update, or a concrete blocker that can be fixed now.
 - `WAIT`: CI is running/pending/queued, the PR/MR is still a draft, review or approval is required, merge-when-pipeline-succeeds/auto-merge is enabled, or there is no actionable failure yet. Arm the local watcher when an active Goal depends on later state.
 - `DONE`: merged, closed intentionally, or all checks are green and no obvious remote blocker remains. The helpers require positive merge evidence for that last case — GitHub `mergeStateStatus` `CLEAN`/`HAS_HOOKS`, GitLab `detailed_merge_status: mergeable`. A green pipeline alone is never `DONE`; a still-running pipeline stays `WAIT` even when the GitLab gate already reports `mergeable` (CI is not a required merge check there); and an unrecognized provider state is `WAIT`.
+
+`DONE` is the MR/PR decision, not blanket CI or delivery acceptance: merged/closed takes precedence in the classifier. Always report `ci` separately; merged with failed/pending CI does not mean validation passed, and closed-unmerged does not satisfy a merge request. Cleanup still requires exact merged-head and clean-worktree proof.
 
 For `ACTION`, fetch only the failed job logs needed for the next fix. Summarize the failing lines; do not paste full logs unless the user asks. Before triaging a failed, canceled, or manual GitLab pipeline — or a job that looks stuck — read `$SKILL_DIR/references/gitlab-triage.md` (fetch recipes, infrastructure-vs-code-defect rule, never-auto-retry-lint/test rule, stuck-runner flow).
 

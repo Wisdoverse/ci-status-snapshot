@@ -97,6 +97,72 @@ def test_new_push_wakes() -> None:
     assert event["current"]["head_sha"] == "def456"
 
 
+def test_push_before_first_read_wakes() -> None:
+    pushed = snapshot("WAIT", 1)
+    pushed["head_sha"] = "def456"
+    states = iter([pushed])
+    event, exit_code = watch(lambda: next(states), 0, 3, 0, sleep_fn=lambda _: None, expected_head="abc123")
+    assert exit_code == 0
+    assert event["initial"] is True and event["reason"] == "head_changed"
+    assert event["expected_head"] == "abc123"
+    assert event["current"]["head_sha"] == "def456"
+    assert event["current"]["snapshot_time_utc"]
+
+
+def test_matching_handoff_stays_silent_until_change() -> None:
+    states = iter([snapshot("WAIT", 2), snapshot("WAIT", 1), snapshot("DONE", 0)])
+    event, exit_code = watch(lambda: next(states), 0, 3, 0, sleep_fn=lambda _: None, expected_head="abc123")
+    assert exit_code == 0 and "initial" not in event
+    assert event["current"]["conclusion"] == "DONE"
+
+
+def test_missing_head_cannot_establish_handoff() -> None:
+    missing = snapshot("WAIT", 1)
+    missing.pop("head_sha")
+    event, exit_code = watch(lambda: missing, 0, 3, 0, sleep_fn=lambda _: None, expected_head="abc123")
+    assert exit_code == 2 and event["consecutive_errors"] == 3
+    assert event["last_snapshot"] is None
+
+
+def test_error_preserves_last_observation_without_claiming_freshness() -> None:
+    calls = 0
+
+    def sequence() -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return snapshot("WAIT", 1)
+        raise RuntimeError("connection unavailable")
+
+    event, exit_code = watch(sequence, 0, 3, 0, sleep_fn=lambda _: None)
+    assert exit_code == 2 and "current" not in event
+    assert event["last_snapshot"]["head_sha"] == "abc123"
+    assert event["last_snapshot"]["snapshot_time_utc"]
+
+
+def test_cli_emits_one_targeted_event() -> None:
+    import io
+    import json
+    from contextlib import redirect_stdout
+    from unittest.mock import patch
+
+    from ci_state_watch import main
+
+    pushed = snapshot("WAIT", 1)
+    pushed["head_sha"] = "b" * 40
+    output = io.StringIO()
+    with patch("sys.argv", ["ci_state_watch.py", "--provider", "gitlab", "--selector", "2400", "--expected-head", "a" * 40, "--timeout-seconds", "1"]), \
+         patch("ci_state_watch.take_snapshot", return_value=pushed), redirect_stdout(output):
+        assert main() == 0
+    lines = output.getvalue().splitlines()
+    assert len(lines) == 1
+    event = json.loads(lines[0])
+    assert event["watch"]["selector"] == "2400"
+    assert event["watch"]["expected_head"] == "a" * 40
+    assert event["watch"]["cwd"] and event["event_time_utc"]
+    assert event["current"]["head_sha"] == "b" * 40
+
+
 def test_sleep_capped_by_timeout() -> None:
     sleeps: list[float] = []
     clock = iter([0.0, 0.5, 0.5, 2.0, 2.0])
@@ -111,6 +177,9 @@ def test_sleep_capped_by_timeout() -> None:
     assert exit_code == 3
     assert event["event"] == "timeout"
     assert all(s <= 1.0 for s in sleeps), sleeps
+    assert "current" not in event
+    assert event["last_snapshot"]["head_sha"] == "abc123"
+    assert event["last_snapshot"]["snapshot_time_utc"]
 
 
 def test_recovery_resets_debounce() -> None:
