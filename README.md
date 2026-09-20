@@ -88,6 +88,8 @@ cd skills/ci-status-snapshot
 python3 scripts/ci_status_snapshot.py --selector 123
 python3 scripts/ci_status_snapshot.py --provider gitlab --selector 396 --json
 
+# Numeric GitLab IIDs use one REST MR request; branch and URL selectors retain `glab mr view` routing.
+
 # Silent watcher: one JSON event on the first decision-relevant change
 # exit 0 = change, 2 = three consecutive errors, 3 = timeout backstop
 python3 scripts/ci_state_watch.py --provider github --selector 123 --expected-head <full-head-sha> --interval-seconds 30

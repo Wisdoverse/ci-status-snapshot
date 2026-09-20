@@ -50,6 +50,64 @@ def gl(pipeline: Any = "success", gate: str = "mergeable", state: str = "opened"
     return css.gitlab_snapshot("3")
 
 
+def capture_gitlab(selector: str | None, response: tuple[int, str, str] = (0, "", "")) -> tuple[list[tuple[list[str], int]], dict[str, Any] | None, str | None]:
+    calls: list[tuple[list[str], int]] = []
+    original_run = css.run
+
+    def fake_run(cmd: list[str], timeout: int = 25) -> tuple[int, str, str]:
+        calls.append((cmd, timeout))
+        return response
+
+    css.run = fake_run
+    try:
+        try:
+            snapshot = css.gitlab_snapshot(selector)
+            return calls, snapshot, None
+        except SystemExit as exc:
+            return calls, None, str(exc)
+    finally:
+        css.run = original_run
+
+
+def test_gitlab_numeric_iid_uses_single_api_call() -> None:
+    payload = json.dumps(
+        {
+            "iid": 396,
+            "state": "opened",
+            "draft": False,
+            "detailed_merge_status": "mergeable",
+            "head_pipeline": {"id": 9, "status": "success"},
+        }
+    )
+    calls, snapshot, error = capture_gitlab("396", (0, payload, ""))
+    assert error is None and snapshot is not None, error
+    assert calls == [(["glab", "api", "projects/:fullpath/merge_requests/396"], 25)], calls
+    assert snapshot["conclusion"] == "DONE", snapshot
+
+
+def test_gitlab_non_numeric_selectors_keep_mr_view() -> None:
+    payload = json.dumps({"iid": 396, "state": "opened", "detailed_merge_status": "mergeable"})
+    for selector in [None, "", "feature/foo", "https://gitlab.example.test/group/project/-/merge_requests/396", "٣٩٦"]:
+        calls, _, error = capture_gitlab(selector, (0, payload, ""))
+        assert error is None, (selector, error)
+        expected = ["glab", "mr", "view"]
+        if selector:
+            expected.append(selector)
+        expected.extend(["--output", "json"])
+        assert calls == [(expected, 25)], (selector, calls)
+
+
+def test_gitlab_snapshot_errors_name_the_single_api_call() -> None:
+    for response, expected in [
+        ((7, "", "permission denied"), "permission denied"),
+        ((124, "", "glab timed out"), "glab timed out"),
+        ((0, "not-json", ""), "Could not parse JSON from glab api projects/:fullpath/merge_requests/396"),
+    ]:
+        calls, snapshot, error = capture_gitlab("396", response)
+        assert snapshot is None and error is not None and expected in error, (response, snapshot, error)
+        assert calls == [(["glab", "api", "projects/:fullpath/merge_requests/396"], 25)], calls
+
+
 # --- GitHub -----------------------------------------------------------------
 
 
