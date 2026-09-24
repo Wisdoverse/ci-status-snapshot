@@ -337,15 +337,21 @@ def classify_gitlab(
 
 
 def gitlab_snapshot(selector: str | None) -> dict[str, Any]:
-    cmd = ["glab", "mr", "view"]
-    if selector:
-        cmd.append(selector)
-    cmd.extend(["--output", "json"])
+    numeric_iid = bool(selector) and selector.isascii() and selector.isdecimal()
+    if numeric_iid:
+        cmd = ["glab", "api", f"projects/:fullpath/merge_requests/{selector}"]
+        source = f"glab api projects/:fullpath/merge_requests/{selector}"
+    else:
+        cmd = ["glab", "mr", "view"]
+        if selector:
+            cmd.append(selector)
+        cmd.extend(["--output", "json"])
+        source = "glab mr view"
     code, out, err = run(cmd)
     if code != 0:
-        raise SystemExit(err or "glab mr view failed")
+        raise SystemExit(err or f"{source} failed")
 
-    data = load_json_or_die(out, "glab mr view")
+    data = load_json_or_die(out, source)
     pipeline = first(data, "head_pipeline", "headPipeline", "pipeline") or {}
     if not isinstance(pipeline, dict):
         pipeline = {}

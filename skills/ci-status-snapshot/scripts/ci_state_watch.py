@@ -6,9 +6,11 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import sys
 import time
 from collections.abc import Callable
+from datetime import datetime, timezone
 from typing import Any
 
 from ci_status_snapshot import detect_provider, github_snapshot, gitlab_snapshot
@@ -74,6 +76,7 @@ def watch(
     timeout_seconds: float,
     sleep_fn: Callable[[float], None] = time.sleep,
     monotonic_fn: Callable[[], float] = time.monotonic,
+    expected_head: str | None = None,
 ) -> tuple[dict[str, Any], int]:
     started = monotonic_fn()
     baseline: str | None = None
@@ -81,16 +84,27 @@ def watch(
     errors = 0
     total_errors = 0
     last_error = ""
+    last_snapshot: dict[str, Any] | None = None
 
     while True:
         try:
-            current = snapshot_fn()
+            current = dict(snapshot_fn())
+            current["snapshot_time_utc"] = datetime.now(timezone.utc).isoformat()
+            if expected_head is not None and not current.get("head_sha"):
+                raise RuntimeError("snapshot has no head SHA to verify the watcher handoff")
+            last_snapshot = current
             if not is_transient_merge_state(current.get("merge_state")):
                 solid_merge_state = current.get("merge_state")
             current_fingerprint = fingerprint(current, solid_merge_state)
             errors = 0
             last_error = ""
             if baseline is None:
+                # WAIT can remain WAIT while a push replaces the reviewed head
+                # between the caller's snapshot and our first read. Do not
+                # silently adopt that new head as the baseline.
+                if expected_head is not None and current["head_sha"] != expected_head:
+                    return {"event": "change", "initial": True, "reason": "head_changed",
+                            "expected_head": expected_head, "current": current}, 0
                 # Guard against the snapshot->arm race: if state already left
                 # WAIT before the watcher started, report it now instead of
                 # silently baselining a terminal state and burning the full
@@ -109,12 +123,14 @@ def watch(
             total_errors += 1
             last_error = str(exc)
             if errors >= error_threshold:
-                return {"event": "error", "consecutive_errors": errors, "total_errors": total_errors, "error": last_error}, 2
+                return {"event": "error", "consecutive_errors": errors, "total_errors": total_errors,
+                        "error": last_error, "last_snapshot": last_snapshot}, 2
 
         elapsed = monotonic_fn() - started
         if timeout_seconds > 0:
             if elapsed >= timeout_seconds:
-                return {"event": "timeout", "elapsed_seconds": round(elapsed, 3), "total_errors": total_errors, "last_error": last_error}, 3
+                return {"event": "timeout", "elapsed_seconds": round(elapsed, 3), "total_errors": total_errors,
+                        "last_error": last_error, "last_snapshot": last_snapshot}, 3
             sleep_fn(min(interval_seconds, timeout_seconds - elapsed))
         else:
             sleep_fn(interval_seconds)
@@ -127,10 +143,15 @@ def main() -> int:
     # branch" on every poll, so any checkout during the watcher's (up to 2h)
     # life silently retargets the watch at a different PR/MR
     parser.add_argument("--selector", required=True, help="PR/MR number, URL, or branch selector")
+    parser.add_argument("--expected-head", help="Full head SHA from the caller's snapshot; detects a push before the first read")
     parser.add_argument("--interval-seconds", type=float, default=30.0)
     parser.add_argument("--error-threshold", type=int, default=3)
     parser.add_argument("--timeout-seconds", type=float, default=7200.0, help="backstop against orphan processes; 0 waits indefinitely")
     args = parser.parse_args()
+    if args.expected_head is not None:
+        args.expected_head = args.expected_head.lower()
+        if len(args.expected_head) not in {40, 64} or any(c not in "0123456789abcdef" for c in args.expected_head):
+            parser.error("expected head must be a full 40- or 64-character hexadecimal SHA")
     if not (math.isfinite(args.interval_seconds) and math.isfinite(args.timeout_seconds)):
         parser.error("interval and timeout must be finite numbers")
     # upper bounds keep time.sleep from raising OverflowError (~9.2e9s limit)
@@ -144,7 +165,13 @@ def main() -> int:
         args.interval_seconds,
         args.error_threshold,
         args.timeout_seconds,
+        expected_head=args.expected_head,
     )
+    # Errors before the first successful read still need an unambiguous target.
+    # last_snapshot on error/timeout is context, never a fresh status claim.
+    event["watch"] = {"provider": args.provider, "selector": args.selector,
+                      "expected_head": args.expected_head, "cwd": os.getcwd()}
+    event["event_time_utc"] = datetime.now(timezone.utc).isoformat()
     print(json.dumps(event, ensure_ascii=True, sort_keys=True))
     return exit_code
 

@@ -7,14 +7,14 @@ Read this when the user asks to submit, merge, "merge when CI passes", or to han
 
 When the user asks to submit, merge, or "merge when CI passes", do the remote workflow without chat polling:
 
-1. Take one compact snapshot before acting.
+1. Use one compact status/delegation snapshot before acting; reuse already-fresh fields instead of invoking both helpers on unchanged state.
 2. If CI is failed or canceled, fetch only failed/canceled jobs and the shortest useful trace tail — the recipes are in `$SKILL_DIR/references/gitlab-triage.md`.
 3. Fix locally, run the narrow gate that proves the fix, and run the formatter/linter gate that failed remotely.
 4. If the MR should stay as one clean commit, amend the existing commit and push with `git push --force-with-lease` only to the branch you just amended.
-5. After any push, take exactly one fresh snapshot because the branch SHA changed. Re-enable auto-merge/merge-when-pipeline-succeeds when policy and permissions allow, then arm one local watcher if the snapshot is `WAIT`.
+5. After a push, verify the new head and enable auto-merge/merge-when-pipeline-succeeds when policy and permissions allow. Reuse the mutation response when sufficient; otherwise take one delegation snapshot. If it is `WAIT`/delegated, arm one watcher with `--expected-head <that full SHA>`. Do not follow it with another status helper.
 6. If GitLab reports the MR as merged while the MR head pipeline is still pending/running, do not treat the merge as CI success. Report the split state from the snapshot instead of waiting: merged is done for Git state, CI is still pending for validation state.
-7. After a successful merge, clean the local feature worktree and branch promptly: fast-forward the root `DEV` checkout, remove the feature worktree, delete the local branch, fetch/prune remotes, and run `git worktree prune`.
-8. If the user asks to ensure the MR merges, enable server-side auto-merge for the current head SHA, run `$SKILL_DIR/scripts/ci_merge_delegate.py` once to confirm delegation or an immediate blocker, and arm the local watcher while the Goal remains unfinished.
+7. When cleanup is authorized, verify the exact merged source head, integration ancestry (or reviewed squash equivalence), clean owned worktree and no open dependents. Then fast-forward the repository's integration checkout if safe and remove only the proved-owned feature worktree/branch. Preserve unrelated dirt and closed-unmerged work; do not assume every repository uses `DEV`.
+8. If the user asks to ensure the MR merges, enable server-side auto-merge for the exact head. Reuse the returned state or run `$SKILL_DIR/scripts/ci_merge_delegate.py` once if needed to confirm delegation, then arm the local watcher while the Goal remains unfinished. Retain its target, head and attached tool handle for handoff.
 
 Do not wait for a running pipeline in model turns. Server-side auto-merge preserves merge intent; the local watcher supplies the event that resumes the Goal.
 
