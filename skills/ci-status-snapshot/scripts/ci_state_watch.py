@@ -16,11 +16,14 @@ from typing import Any
 from ci_status_snapshot import detect_provider, github_snapshot, gitlab_snapshot
 
 
-def take_snapshot(provider: str, selector: str) -> dict[str, Any]:
+def take_snapshot(provider: str, selector: str, allow_no_pipeline: bool = False) -> dict[str, Any]:
+    # called on every poll with the CLI's setting: the opt-out is never
+    # inferred from, or frozen at, the first snapshot
     resolved = detect_provider() if provider == "auto" else provider
     if resolved == "unknown":
         raise RuntimeError("Could not detect provider; pass --provider github or --provider gitlab")
-    return github_snapshot(selector) if resolved == "github" else gitlab_snapshot(selector)
+    snapshot_fn = github_snapshot if resolved == "github" else gitlab_snapshot
+    return snapshot_fn(selector, allow_no_pipeline=allow_no_pipeline)
 
 
 # Merge-gate values that describe the MACHINE still working, not a decision
@@ -147,6 +150,14 @@ def main() -> int:
     parser.add_argument("--interval-seconds", type=float, default=30.0)
     parser.add_argument("--error-threshold", type=int, default=3)
     parser.add_argument("--timeout-seconds", type=float, default=7200.0, help="backstop against orphan processes; 0 waits indefinitely")
+    parser.add_argument(
+        "--allow-no-pipeline",
+        action="store_true",
+        help=(
+            "This project runs no CI for the PR/MR: a missing GitLab head pipeline or zero registered "
+            "GitHub checks is nothing to wait for. Without it, a mergeable PR/MR with no CI yet is WAIT."
+        ),
+    )
     args = parser.parse_args()
     if args.expected_head is not None:
         args.expected_head = args.expected_head.lower()
@@ -161,7 +172,7 @@ def main() -> int:
         parser.error("timeout must be 0-31536000 seconds (0 waits indefinitely)")
 
     event, exit_code = watch(
-        lambda: take_snapshot(args.provider, args.selector),
+        lambda: take_snapshot(args.provider, args.selector, args.allow_no_pipeline),
         args.interval_seconds,
         args.error_threshold,
         args.timeout_seconds,
@@ -170,7 +181,8 @@ def main() -> int:
     # Errors before the first successful read still need an unambiguous target.
     # last_snapshot on error/timeout is context, never a fresh status claim.
     event["watch"] = {"provider": args.provider, "selector": args.selector,
-                      "expected_head": args.expected_head, "cwd": os.getcwd()}
+                      "expected_head": args.expected_head, "allow_no_pipeline": args.allow_no_pipeline,
+                      "cwd": os.getcwd()}
     event["event_time_utc"] = datetime.now(timezone.utc).isoformat()
     print(json.dumps(event, ensure_ascii=True, sort_keys=True))
     return exit_code

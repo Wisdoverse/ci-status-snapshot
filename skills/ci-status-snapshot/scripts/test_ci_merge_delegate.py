@@ -354,6 +354,157 @@ def test_failed_jobs_api_error_is_explicit() -> None:
     assert "failed_jobs" not in payload, payload
 
 
+# --- scenario stub: every glab call is logged, responses are served in order --
+
+HEAD = "a" * 40
+MR_PATH = "projects/115/merge_requests/396"
+NOTES_PATH = f"{MR_PATH}/notes?order_by=created_at&sort=desc&per_page=100&page=1"
+MERGE_PATH = f"{MR_PATH}/merge"
+MR_GET = ["api", MR_PATH]
+NOTES_GET = ["api", NOTES_PATH]
+# the no-flag payload shape; --enable output may add fields, this may not
+BASE_KEYS = [
+    "result", "provider", "project", "mr", "state", "sha", "merge_status", "auto_merge",
+    "draft", "pipeline_id", "pipeline_status", "web_url", "snapshot_time_utc",
+]
+
+SCENARIO_STUB = textwrap.dedent(
+    """\
+    #!/usr/bin/env python3
+    import json
+    import os
+    import sys
+
+    argv = sys.argv[1:]
+    log = os.environ["GLAB_LOG"]
+    with open(log, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(argv) + "\\n")
+    with open(os.environ["GLAB_SCENARIO"], encoding="utf-8") as fh:
+        scenario = json.load(fh)
+    path = argv[1] if len(argv) > 1 else ""
+    if "--method" in argv:
+        key = "put"
+    elif "/notes?" in path:
+        key = "notes"
+    elif "/jobs?" in path:
+        key = "jobs"
+    elif path.endswith("/merge_requests/396"):
+        key = "mr"
+    else:
+        print("unexpected call: " + json.dumps(argv), file=sys.stderr)
+        sys.exit(1)
+    counter = log + "." + key
+    index = int(open(counter).read()) if os.path.exists(counter) else 0
+    with open(counter, "w") as fh:
+        fh.write(str(index + 1))
+    responses = scenario.get(key, [])
+    if index >= len(responses):
+        print("no response %d scripted for %s" % (index, key), file=sys.stderr)
+        sys.exit(1)
+    response = responses[index]
+    if "json" in response:
+        print(json.dumps(response["json"]))
+    else:
+        sys.stdout.write(response.get("stdout", ""))
+        sys.stderr.write(response.get("stderr", ""))
+    sys.exit(response.get("code", 0))
+    """
+)
+
+
+def ok(body: object) -> dict[str, object]:
+    return {"json": body}
+
+
+def fail(stderr: str = "HTTP 502 Bad Gateway", code: int = 1) -> dict[str, object]:
+    return {"code": code, "stderr": stderr}
+
+
+def pipeline(**overrides: object) -> dict[str, object]:
+    body: dict[str, object] = {"id": 123, "sha": HEAD, "status": "running", "created_at": "2026-09-24T10:00:00.000Z"}
+    body.update(overrides)
+    return body
+
+
+def mr_body(**overrides: object) -> dict[str, object]:
+    body: dict[str, object] = {
+        "state": "opened",
+        "sha": HEAD,
+        "target_branch": "main",
+        "draft": False,
+        "detailed_merge_status": "mergeable",
+        "merge_when_pipeline_succeeds": False,
+        "web_url": "https://gitlab.example.test/group/project/-/merge_requests/396",
+        "head_pipeline": pipeline(),
+    }
+    body.update(overrides)
+    return body
+
+
+def run_scenario(scenario: dict[str, object], *flags: str, as_json: bool = True) -> tuple[subprocess.CompletedProcess[str], list[list[str]]]:
+    with tempfile.TemporaryDirectory() as tmp:
+        temp_dir = Path(tmp)
+        stub = temp_dir / "glab"
+        stub.write_text(SCENARIO_STUB, encoding="utf-8")
+        stub.chmod(0o755)
+        (temp_dir / "scenario.json").write_text(json.dumps(scenario), encoding="utf-8")
+        log = temp_dir / "calls.log"
+        env = os.environ.copy()
+        env["PATH"] = f"{temp_dir}{os.pathsep}{env['PATH']}"
+        env["GLAB_SCENARIO"] = str(temp_dir / "scenario.json")
+        env["GLAB_LOG"] = str(log)
+        cmd = [sys.executable, str(SCRIPT), "--provider", "gitlab", "--project", "115", "--selector", "396", *flags]
+        if as_json:
+            cmd.append("--json")
+        proc = subprocess.run(cmd, check=False, capture_output=True, text=True, env=env)
+        calls = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()] if log.exists() else []
+    return proc, calls
+
+
+def result_of(proc: subprocess.CompletedProcess[str]) -> dict[str, object]:
+    assert proc.stdout, proc.stderr
+    return json.loads(proc.stdout)
+
+
+def test_delegate_mergeable_no_pipeline_and_optout() -> None:
+    # GitLab can report mergeable before the pipeline exists: by default that
+    # is no_pipeline_observed (exit 0), never a mergeable_unmerged hand-off
+    no_pipeline = {"mr": [ok(mr_body(head_pipeline=None))]}
+    proc, calls = run_scenario(no_pipeline)
+    assert proc.returncode == 0, proc.stderr or proc.stdout
+    payload = result_of(proc)
+    assert payload["result"] == "no_pipeline_observed", payload
+    assert sorted(payload) == sorted(BASE_KEYS), payload
+    assert calls == [MR_GET], calls
+
+    proc, calls = run_scenario(no_pipeline, "--allow-no-pipeline")
+    assert proc.returncode == 3, proc.stderr or proc.stdout
+    assert result_of(proc)["result"] == "mergeable_unmerged", proc.stdout
+    assert calls == [MR_GET], calls
+
+    # the delegate names its result from the classifier alone: under the
+    # opt-out a pipeline-free MR with armed auto-merge and a settling gate is
+    # delegated, not a second, delegate-local "no pipeline" verdict
+    settling = {"mr": [ok(mr_body(head_pipeline=None, detailed_merge_status="checking", merge_when_pipeline_succeeds=True))]}
+    proc, _ = run_scenario(settling, "--allow-no-pipeline")
+    assert proc.returncode == 0 and result_of(proc)["result"] == "delegated_auto_merge", proc.stdout
+    proc, _ = run_scenario(settling)
+    assert proc.returncode == 0 and result_of(proc)["result"] == "no_pipeline_observed", proc.stdout
+
+    # an unrelated no-flag result keeps its exact JSON and text shape
+    running = {"mr": [ok(mr_body(merge_when_pipeline_succeeds=True))]}
+    for flags in [(), ("--allow-no-pipeline",)]:
+        proc, calls = run_scenario(running, *flags)
+        assert proc.returncode == 0, proc.stderr or proc.stdout
+        payload = result_of(proc)
+        assert payload["result"] == "delegated_auto_merge" and sorted(payload) == sorted(BASE_KEYS), payload
+        assert calls == [MR_GET], calls
+        proc, _ = run_scenario(running, *flags, as_json=False)
+        assert proc.returncode == 0, proc.stderr or proc.stdout
+        assert [line.split("=", 1)[0] for line in proc.stdout.splitlines()] == BASE_KEYS, proc.stdout
+        assert proc.stdout.splitlines()[0] == "result=delegated_auto_merge", proc.stdout
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):

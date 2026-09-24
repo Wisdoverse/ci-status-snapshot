@@ -160,7 +160,7 @@ def summarize_github_check(item: dict[str, Any]) -> dict[str, str]:
     return {"name": str(name), "status": status, "conclusion": conclusion, "effective": effective}
 
 
-def github_snapshot(selector: str | None) -> dict[str, Any]:
+def github_snapshot(selector: str | None, allow_no_pipeline: bool = False) -> dict[str, Any]:
     fields = ",".join(
         [
             "number",
@@ -235,9 +235,15 @@ def github_snapshot(selector: str | None) -> dict[str, Any]:
         conclusion, reason = "WAIT", f"unrecognized merge state: {merge_state}" if merge_state else "no actionable failure in one-shot snapshot"
     elif checks and len(success) == len(checks):
         conclusion, reason = "DONE", "checks are green"
+    elif not checks and allow_no_pipeline:
+        # the caller asserted this repository runs no CI at all
+        conclusion, reason = "DONE", f"no checks reported; merge state is {merge_state}"
     elif not checks:
-        # ambiguous right after a push: checks may still be registering
-        conclusion, reason = "DONE", f"no checks reported; merge state is {merge_state} (checks may still be registering if just pushed)"
+        # right after a push GitHub can report CLEAN before Actions has
+        # registered a single check run: zero checks is not evidence that CI
+        # passed, so wait for them to appear (the watcher follows this state)
+        conclusion, reason = "WAIT", "no checks reported yet"
+        blockers.append("no checks reported")
     else:
         conclusion, reason = "WAIT", "no actionable failure in one-shot snapshot"
 
@@ -269,6 +275,9 @@ def classify_gitlab(
     detailed_merge: str,
     merge_status: str,
     draft: bool,
+    *,
+    pipeline_observed: bool,
+    allow_no_pipeline: bool = False,
 ) -> tuple[str, str, str]:
     """The one GitLab MR decision, shared with ci_merge_delegate.py.
 
@@ -276,7 +285,16 @@ def classify_gitlab(
     merge delegate can name its result from this decision instead of keeping a
     second copy of the state tables that drifts away from this one. All inputs
     are already normalized (lowercase, "" when absent).
+
+    `pipeline_observed` means the MR carries a head pipeline with an id.
+    Absence is a property of the pipeline object, never of its status string:
+    an identified pipeline with an empty or unrecognized status is observed CI
+    that cannot be read, not absent CI. `allow_no_pipeline` is the caller's
+    explicit statement that this project runs no pipeline for the MR.
     """
+    if not pipeline_observed:
+        # a status without a pipeline id is not an observed pipeline
+        pipeline_status = ""
     # manual pipelines are terminal without a human. skipped ([ci skip], rules
     # filtering) only blocks when the merge gate actually requires a pipeline
     # ("ci_must_pass") or on legacy servers with no detailed_merge_status at all
@@ -305,23 +323,29 @@ def classify_gitlab(
         # pipeline-independent evidence, and hiding it behind "we cannot read the
         # pipeline" would lose a real blocker
         return "WAIT", "human_gate", f"merge gate: {detailed_merge}"
+    if not pipeline_observed and not allow_no_pipeline:
+        # right after a push or retarget GitLab can report mergeable before it
+        # has created the pipeline, and DONE there would report (or merge) ahead
+        # of CI. Below every blocker above, above every optimistic outcome below.
+        return "WAIT", "no_pipeline_observed", "no pipeline observed"
     if detailed_merge == "mergeable" and pipeline_status in PENDING_STATES:
         # where CI is not a required merge check, GitLab reports mergeable while
         # the pipeline is still running: the merge gate is open but validation is
         # not finished, and "CI running" is never DONE
         return "WAIT", "pipeline_pending", f"pipeline {pipeline_status} (merge gate already mergeable)"
-    if pipeline_status and pipeline_status not in SUCCESS_STATES and pipeline_status not in PENDING_STATES and pipeline_status != "skipped":
+    if pipeline_observed and pipeline_status not in SUCCESS_STATES and pipeline_status not in PENDING_STATES and pipeline_status != "skipped":
         # fail closed: a status in none of the tables (a value GitLab adds later,
-        # or a literal "unknown") is not evidence that CI passed. Unknown blocks
-        # OPTIMISTIC outcomes, never negative ones — a mergeable gate may not
-        # promote it to DONE and a settling gate may not let the delegate call it
-        # delegated, but a known human gate above still reports its own blocker.
-        return "WAIT", "unknown", f"unrecognized pipeline status: {pipeline_status}"
+        # a literal "unknown", or an identified pipeline with no status at all)
+        # is not evidence that CI passed. Unknown blocks OPTIMISTIC outcomes,
+        # never negative ones — a mergeable gate may not promote it to DONE and
+        # a settling gate may not let the delegate call it delegated, but a
+        # known human gate above still reports its own blocker.
+        return "WAIT", "unknown", f"unrecognized pipeline status: {pipeline_status or '(empty)'}"
     if detailed_merge == "mergeable":
         # authoritative once CI is neither running nor unrecognized: GitLab
         # itself says this MR can merge right now, whether the pipeline was
-        # green, skipped, or never created. A green pipeline on its own never
-        # reaches this line.
+        # green, skipped, or — only with the explicit no-pipeline opt-out —
+        # never created. A green pipeline on its own never reaches this line.
         return "DONE", "mergeable", "GitLab reports the MR mergeable"
     if detailed_merge in GL_GATE_WAIT:
         return "WAIT", "merge_gate_pending", f"merge gate: {detailed_merge}"
@@ -336,7 +360,7 @@ def classify_gitlab(
     return "WAIT", "unknown", "no actionable failure in one-shot snapshot"
 
 
-def gitlab_snapshot(selector: str | None) -> dict[str, Any]:
+def gitlab_snapshot(selector: str | None, allow_no_pipeline: bool = False) -> dict[str, Any]:
     numeric_iid = bool(selector) and selector.isascii() and selector.isdecimal()
     if numeric_iid:
         cmd = ["glab", "api", f"projects/:fullpath/merge_requests/{selector}"]
@@ -362,7 +386,15 @@ def gitlab_snapshot(selector: str | None) -> dict[str, Any]:
     merge_status = norm(first(data, "merge_status", "mergeStatus"))
     draft = bool(first(data, "draft", "work_in_progress", "workInProgress"))
 
-    conclusion, cause, reason = classify_gitlab(state, pipeline_status, detailed_merge, merge_status, draft)
+    conclusion, cause, reason = classify_gitlab(
+        state,
+        pipeline_status,
+        detailed_merge,
+        merge_status,
+        draft,
+        pipeline_observed=first(pipeline, "id", "iid") is not None,
+        allow_no_pipeline=allow_no_pipeline,
+    )
 
     # evidence list for the human-readable report; the decision above owns the
     # conclusion, so the pipeline is only listed when the decision actually
@@ -371,6 +403,8 @@ def gitlab_snapshot(selector: str | None) -> dict[str, Any]:
     blockers: list[str] = []
     if cause in {"pipeline", "pipeline_pending"}:
         blockers.append(f"pipeline {pipeline_status}")
+    elif cause == "no_pipeline_observed":
+        blockers.append("no pipeline observed")
     if conclusion != "DONE":
         # a DONE MR has no blockers by definition: merged/closed MRs still report
         # detailed_merge_status "not_open" and can carry a stale draft flag, and
@@ -436,13 +470,22 @@ def main() -> int:
     parser.add_argument("--provider", choices=["auto", "github", "gitlab"], default="auto")
     parser.add_argument("--selector", help="PR/MR number, URL, or branch selector")
     parser.add_argument("--json", action="store_true", help="print JSON instead of text")
+    parser.add_argument(
+        "--allow-no-pipeline",
+        action="store_true",
+        help=(
+            "This project runs no CI for the PR/MR: a missing GitLab head pipeline or zero registered "
+            "GitHub checks is nothing to wait for. Without it, a mergeable PR/MR with no CI yet is WAIT."
+        ),
+    )
     args = parser.parse_args()
 
     provider = args.provider if args.provider != "auto" else detect_provider()
     if provider == "unknown":
         raise SystemExit("Could not detect provider from git remote; pass --provider github or --provider gitlab")
 
-    snapshot = github_snapshot(args.selector) if provider == "github" else gitlab_snapshot(args.selector)
+    snapshot_fn = github_snapshot if provider == "github" else gitlab_snapshot
+    snapshot = snapshot_fn(args.selector, allow_no_pipeline=args.allow_no_pipeline)
     snapshot["snapshot_time_utc"] = datetime.now(timezone.utc).isoformat()
     if args.json:
         print(json.dumps(snapshot, ensure_ascii=True, indent=2, sort_keys=True))

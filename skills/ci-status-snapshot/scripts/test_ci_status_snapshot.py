@@ -22,7 +22,14 @@ def check(status: str = "COMPLETED", conclusion: str = "SUCCESS", name: str = "c
     return {"name": name, "status": status, "conclusion": conclusion}
 
 
-def gh(checks: Any = (), merge_state: str = "CLEAN", state: str = "OPEN", review: str = "", draft: bool = False) -> dict[str, Any]:
+def gh(
+    checks: Any = (),
+    merge_state: str = "CLEAN",
+    state: str = "OPEN",
+    review: str = "",
+    draft: bool = False,
+    allow_no_pipeline: bool = False,
+) -> dict[str, Any]:
     stub(
         {
             "number": 1,
@@ -33,10 +40,21 @@ def gh(checks: Any = (), merge_state: str = "CLEAN", state: str = "OPEN", review
             "statusCheckRollup": list(checks),
         }
     )
-    return css.github_snapshot("1")
+    return css.github_snapshot("1", allow_no_pipeline=allow_no_pipeline)
 
 
-def gl(pipeline: Any = "success", gate: str = "mergeable", state: str = "opened", merge_status: str = "", draft: bool = False) -> dict[str, Any]:
+_UNSET: Any = object()
+
+
+def gl(
+    pipeline: Any = "success",
+    gate: str = "mergeable",
+    state: str = "opened",
+    merge_status: str = "",
+    draft: bool = False,
+    allow_no_pipeline: bool = False,
+    head_pipeline: Any = _UNSET,
+) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "iid": 3,
         "state": state,
@@ -44,10 +62,12 @@ def gl(pipeline: Any = "success", gate: str = "mergeable", state: str = "opened"
         "detailed_merge_status": gate,
         "merge_status": merge_status,
     }
-    if pipeline is not None:
+    if head_pipeline is not _UNSET:
+        payload["head_pipeline"] = head_pipeline
+    elif pipeline is not None:
         payload["head_pipeline"] = {"id": 9, "status": pipeline}
     stub(payload)
-    return css.gitlab_snapshot("3")
+    return css.gitlab_snapshot("3", allow_no_pipeline=allow_no_pipeline)
 
 
 def capture_gitlab(selector: str | None, response: tuple[int, str, str] = (0, "", "")) -> tuple[list[tuple[list[str], int]], dict[str, Any] | None, str | None]:
@@ -178,11 +198,29 @@ def test_github_skipped_and_neutral_are_green() -> None:
     assert snap["conclusion"] == "DONE" and snap["ci"]["success"] == 3, snap
 
 
-def test_github_no_checks_needs_a_positive_merge_state() -> None:
-    clean = gh(checks=[], merge_state="CLEAN")
-    assert clean["conclusion"] == "DONE" and "registering" in clean["reason"], clean
-    assert gh(checks=[], merge_state="HAS_HOOKS")["conclusion"] == "DONE"
-    assert gh(checks=[], merge_state="")["conclusion"] == "WAIT"
+def test_github_no_checks_wait_and_optout() -> None:
+    # CLEAN can arrive before Actions registers a single check run: zero checks
+    # waits by default, and only the explicit no-CI opt-out may call it DONE
+    for merge_state in ["CLEAN", "HAS_HOOKS"]:
+        waiting = gh(checks=[], merge_state=merge_state)
+        assert waiting["conclusion"] == "WAIT", (merge_state, waiting)
+        assert waiting["reason"] == "no checks reported yet", waiting
+        assert waiting["blockers"] == ["no checks reported"], waiting
+        opted_out = gh(checks=[], merge_state=merge_state, allow_no_pipeline=True)
+        assert opted_out["conclusion"] == "DONE" and opted_out["blockers"] == [], (merge_state, opted_out)
+    # registered checks, other merge states and terminal PRs ignore the flag
+    for flag in (False, True):
+        assert gh(checks=[check()], allow_no_pipeline=flag)["conclusion"] == "DONE", flag
+        assert gh(checks=[check(status="IN_PROGRESS", conclusion="")], allow_no_pipeline=flag)["conclusion"] == "WAIT", flag
+        assert gh(checks=[check(conclusion="FAILURE")], allow_no_pipeline=flag)["conclusion"] == "ACTION", flag
+        assert gh(checks=[], merge_state="", allow_no_pipeline=flag)["conclusion"] == "WAIT", flag
+        blocked = gh(checks=[], merge_state="BLOCKED", allow_no_pipeline=flag)
+        assert blocked["conclusion"] == "WAIT" and blocked["reason"] == "merge state: blocked", (flag, blocked)
+        assert gh(checks=[], merge_state="DIRTY", allow_no_pipeline=flag)["conclusion"] == "ACTION", flag
+        assert gh(checks=[], review="REVIEW_REQUIRED", allow_no_pipeline=flag)["reason"] == "review required", flag
+        assert gh(checks=[], draft=True, allow_no_pipeline=flag)["reason"] == "draft", flag
+        for state in ["MERGED", "CLOSED"]:
+            assert gh(checks=[], state=state, allow_no_pipeline=flag)["conclusion"] == "DONE", (flag, state)
 
 
 def test_github_green_checks_need_a_positive_merge_state() -> None:
@@ -212,9 +250,70 @@ def test_github_failure_outranks_pending() -> None:
 
 
 def test_gitlab_mergeable_is_done_once_ci_is_not_running() -> None:
-    for pipeline in ["success", "skipped", "", None]:
+    for pipeline in ["success", "skipped"]:
         snap = gl(pipeline=pipeline, gate="mergeable")
         assert snap["conclusion"] == "DONE", (pipeline, snap)
+
+
+def test_gitlab_absent_pipeline_mergeable_waits() -> None:
+    # GitLab can report mergeable before it has created the pipeline: null,
+    # omitted and id-less head pipelines are all "no CI yet", never DONE
+    for head_pipeline in [None, {}, {"status": "success"}, {"web_url": "https://gitlab.example.test/p/1"}]:
+        snap = gl(gate="mergeable", head_pipeline=head_pipeline)
+        assert snap["conclusion"] == "WAIT", (head_pipeline, snap)
+        assert snap["reason"] == "no pipeline observed", (head_pipeline, snap)
+        assert snap["blockers"] == ["no pipeline observed"], (head_pipeline, snap)
+    omitted = gl(pipeline=None, gate="mergeable")
+    assert omitted["conclusion"] == "WAIT" and omitted["reason"] == "no pipeline observed", omitted
+    assert css.classify_gitlab("opened", "", "mergeable", "", False, pipeline_observed=False) == (
+        "WAIT",
+        "no_pipeline_observed",
+        "no pipeline observed",
+    )
+    # negative control: an identified green pipeline is still DONE
+    green = gl(pipeline="success", gate="mergeable")
+    assert green["conclusion"] == "DONE" and green["blockers"] == [], green
+
+
+def test_gitlab_no_pipeline_precedence_and_optout() -> None:
+    # the opt-out changes exactly one outcome: an open, mergeable MR with no
+    # pipeline becomes DONE
+    opted_out = gl(pipeline=None, gate="mergeable", allow_no_pipeline=True)
+    assert opted_out["conclusion"] == "DONE" and opted_out["blockers"] == [], opted_out
+    # every blocker ranked above a missing pipeline keeps its result either way
+    cases = [
+        ({"state": "merged", "gate": "not_open"}, "DONE", "MR is merged"),
+        ({"state": "closed", "gate": "not_open"}, "DONE", "MR is closed"),
+        ({"gate": "conflict"}, "ACTION", "merge state: conflict"),
+        ({"gate": "", "merge_status": "cannot_be_merged"}, "ACTION", "merge state: cannot_be_merged"),
+        ({"gate": "mergeable", "draft": True}, "WAIT", "draft"),
+        ({"gate": "not_approved"}, "WAIT", "merge gate: not_approved"),
+    ]
+    for flag in (False, True):
+        for kwargs, conclusion, reason in cases:
+            snap = gl(pipeline=None, allow_no_pipeline=flag, **kwargs)
+            assert (snap["conclusion"], snap["reason"]) == (conclusion, reason), (flag, kwargs, snap)
+        # an observed pipeline is never affected by the flag
+        failed = gl(pipeline="failed", gate="mergeable", allow_no_pipeline=flag)
+        assert failed["conclusion"] == "ACTION" and failed["reason"] == "pipeline failed", (flag, failed)
+        running = gl(pipeline="running", gate="mergeable", allow_no_pipeline=flag)
+        assert running["conclusion"] == "WAIT" and "running" in running["reason"], (flag, running)
+    # a settling gate with no pipeline waits either way; only the reason differs
+    assert gl(pipeline=None, gate="checking")["reason"] == "no pipeline observed"
+    assert gl(pipeline=None, gate="checking", allow_no_pipeline=True)["reason"] == "merge gate: checking"
+
+
+def test_gitlab_observed_pipeline_without_status_waits() -> None:
+    # an identified pipeline whose status is empty or unreadable is CI that
+    # exists and cannot be judged: it waits even under the no-pipeline opt-out
+    for status in ["", "unknown", "brand_new_status"]:
+        for flag in (False, True):
+            snap = gl(pipeline=status, gate="mergeable", allow_no_pipeline=flag)
+            assert snap["conclusion"] == "WAIT", (status, flag, snap)
+            assert snap["reason"].startswith("unrecognized pipeline status"), (status, flag, snap)
+    # the genuinely absent pipeline follows the opt-out
+    assert gl(pipeline=None, gate="mergeable")["reason"] == "no pipeline observed"
+    assert gl(pipeline=None, gate="mergeable", allow_no_pipeline=True)["conclusion"] == "DONE"
 
 
 def test_gitlab_unrecognized_pipeline_status_waits() -> None:
@@ -349,6 +448,30 @@ def test_gitlab_draft_waits() -> None:
     assert gl(pipeline="success", gate="mergeable", draft=True)["conclusion"] == "WAIT"
     # but a red pipeline on a draft is still actionable
     assert gl(pipeline="failed", gate="mergeable", draft=True)["conclusion"] == "ACTION"
+
+
+def test_allow_no_pipeline_cli_routing() -> None:
+    import io
+    from contextlib import redirect_stdout
+    from unittest.mock import patch
+
+    for provider in ["github", "gitlab"]:
+        for flags, expected in [([], False), (["--allow-no-pipeline"], True)]:
+            calls: list[tuple[str, str | None, bool]] = []
+
+            def recorder(name: str) -> Any:
+                def fake(selector: str | None, allow_no_pipeline: bool = False) -> dict[str, Any]:
+                    calls.append((name, selector, allow_no_pipeline))
+                    return {"conclusion": "WAIT"}
+
+                return fake
+
+            argv = ["ci_status_snapshot.py", "--provider", provider, "--selector", "12", "--json", *flags]
+            with patch.object(css, "github_snapshot", recorder("github")), \
+                 patch.object(css, "gitlab_snapshot", recorder("gitlab")), \
+                 patch("sys.argv", argv), redirect_stdout(io.StringIO()):
+                assert css.main() == 0
+            assert calls == [(provider, "12", expected)], (provider, flags, calls)
 
 
 if __name__ == "__main__":

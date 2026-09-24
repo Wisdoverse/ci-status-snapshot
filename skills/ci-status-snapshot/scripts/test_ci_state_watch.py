@@ -283,6 +283,41 @@ def test_transient_gate_churn_stays_silent() -> None:
     assert event["current"]["merge_state"] == "mergeable"
 
 
+def test_allow_no_pipeline_cli_routing() -> None:
+    # the opt-out reaches the provider on EVERY poll, not only the first read
+    import io
+    import json
+    from contextlib import redirect_stdout
+    from unittest.mock import patch
+
+    import ci_state_watch
+
+    for flags, expected, sequence in [
+        (["--allow-no-pipeline"], True, [snapshot("WAIT", 1), snapshot("DONE", 0)]),
+        ([], False, [snapshot("DONE", 0)]),
+    ]:
+        calls: list[tuple[str, bool]] = []
+        states = iter(sequence)
+
+        def fake_gitlab(selector: str, allow_no_pipeline: bool = False) -> dict[str, object]:
+            calls.append((selector, allow_no_pipeline))
+            return next(states)
+
+        def wrong_provider(selector: str, allow_no_pipeline: bool = False) -> dict[str, object]:
+            raise AssertionError("github_snapshot called for a gitlab watch")
+
+        output = io.StringIO()
+        argv = ["ci_state_watch.py", "--provider", "gitlab", "--selector", "7",
+                "--interval-seconds", "1", "--timeout-seconds", "60", *flags]
+        with patch("sys.argv", argv), patch.object(ci_state_watch, "gitlab_snapshot", fake_gitlab), \
+             patch.object(ci_state_watch, "github_snapshot", wrong_provider), redirect_stdout(output):
+            assert ci_state_watch.main() == 0
+        assert calls == [("7", expected)] * len(sequence), (flags, calls)
+        event = json.loads(output.getvalue())
+        assert event["event"] == "change" and event["current"]["conclusion"] == "DONE", event
+        assert event["watch"]["allow_no_pipeline"] is expected, event
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):

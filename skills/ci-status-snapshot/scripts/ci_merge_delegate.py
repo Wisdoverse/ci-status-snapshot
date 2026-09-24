@@ -224,6 +224,8 @@ def supervise_gitlab_mr(args: argparse.Namespace) -> int:
         norm(first(data, "detailed_merge_status", "detailedMergeStatus")),
         norm(first(data, "merge_status", "mergeStatus")),
         result["draft"],
+        pipeline_observed=not no_pipeline,
+        allow_no_pipeline=args.allow_no_pipeline,
     )
 
     if cause == "merged":
@@ -276,13 +278,13 @@ def supervise_gitlab_mr(args: argparse.Namespace) -> int:
         return 3
 
     if cause == "draft":
-        # before the no-pipeline branch on purpose: a draft with no pipeline is
-        # blocked by the draft, and reporting "no pipeline observed" would hide it
+        # the classifier ranks draft above a missing pipeline: a draft with no
+        # pipeline is blocked by the draft, and "no pipeline observed" would hide it
         result["result"] = "waiting"
         print_result(result, args.json)
         return 0
 
-    if no_pipeline:
+    if cause == "no_pipeline_observed":
         # not the same as waiting for CI: an MR with no head pipeline may still
         # be registering one, or may never create one (rules, no .gitlab-ci.yml)
         result["result"] = "no_pipeline_observed"
@@ -319,6 +321,14 @@ def main() -> int:
     parser.add_argument("--selector", required=True, help="GitLab MR IID or MR URL")
     parser.add_argument("--project", help="GitLab project id or path. Defaults to CI_PROJECT_ID or git remote path.")
     parser.add_argument("--json", action="store_true", help="Print one terminal JSON object.")
+    parser.add_argument(
+        "--allow-no-pipeline",
+        action="store_true",
+        help=(
+            "This project runs no pipeline for the MR: a mergeable MR with no head pipeline reports "
+            "mergeable_unmerged instead of no_pipeline_observed."
+        ),
+    )
     args = parser.parse_args()
 
     return supervise_gitlab_mr(args)
