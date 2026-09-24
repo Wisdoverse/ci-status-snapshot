@@ -505,6 +505,288 @@ def test_delegate_mergeable_no_pipeline_and_optout() -> None:
         assert proc.stdout.splitlines()[0] == "result=delegated_auto_merge", proc.stdout
 
 
+
+# --- --enable -----------------------------------------------------------------
+
+JOBS_GET = ["api", "projects/115/pipelines/123/jobs?per_page=100"]
+PUT_PAIRS = [
+    ("--method", "PUT"),
+    ("--field", "merge_when_pipeline_succeeds=true"),
+    ("--field", "auto_merge=true"),
+    ("--raw-field", f"sha={HEAD}"),
+]
+
+
+def pairs(argv: list[str]) -> list[tuple[str, str]]:
+    return list(zip(argv, argv[1:]))
+
+
+def puts(calls: list[list[str]]) -> list[list[str]]:
+    return [call for call in calls if "--method" in call]
+
+
+def retarget(created_at: str, body: str = "changed target branch from `develop` to `main`", system: bool = True) -> dict[str, object]:
+    return {"id": 1, "body": body, "system": system, "created_at": created_at}
+
+
+def enable(before: dict[str, object], after: dict[str, object] | None = None, notes: object = (), put: dict[str, object] | None = None) -> tuple[subprocess.CompletedProcess[str], list[list[str]], dict[str, object]]:
+    # the PUT response always looks like success: only the re-read may decide
+    scenario: dict[str, object] = {
+        "mr": [ok(before), ok(after if after is not None else mr_body(merge_when_pipeline_succeeds=True))],
+        # a dict is a raw scripted response; anything else is the list of notes
+        "notes": [notes if isinstance(notes, dict) else ok(list(notes))],
+        "put": [put if put is not None else ok(mr_body(merge_when_pipeline_succeeds=True))],
+        "jobs": [ok([{"id": 10, "name": "unit", "stage": "test", "status": "failed"}])],
+    }
+    proc, calls = run_scenario(scenario, "--enable")
+    return proc, calls, result_of(proc)
+
+
+def test_enable_running_current_head_calls_once() -> None:
+    proc, calls, payload = enable(mr_body())
+    assert proc.returncode == 0, proc.stderr or proc.stdout
+    assert payload["result"] == "delegated_auto_merge" and payload["auto_merge"] is True, payload
+    assert payload["put_attempted"] is True and "put_error" not in payload, payload
+    # exact reads, bounded notes page, one PUT, one confirming re-read
+    assert len(calls) == 4, calls
+    assert calls[0] == MR_GET and calls[1] == NOTES_GET and calls[3] == MR_GET, calls
+    put = calls[2]
+    assert put[:2] == ["api", MERGE_PATH], put
+    for flag, value in PUT_PAIRS:
+        assert (flag, value) in pairs(put), (flag, value, put)
+    # typed booleans only: a --raw-field boolean is the string "true"
+    assert not any(flag == "--raw-field" and value.split("=")[0] != "sha" for flag, value in pairs(put)), put
+    assert len(puts(calls)) == 1, calls
+
+
+def test_enable_refuses_ineligible_mr() -> None:
+    cases = [
+        ({"state": "closed"}, "state_not_open"),
+        ({"state": "merged"}, "state_not_open"),
+        ({"state": "locked"}, "state_not_open"),
+        ({"draft": True}, "draft"),
+        ({"sha": ""}, "head_sha_missing"),
+        ({"head_pipeline": None}, "no_pipeline_observed"),
+        ({"head_pipeline": {"sha": HEAD, "status": "running", "created_at": "2026-09-24T10:00:00Z"}}, "no_pipeline_observed"),
+        ({"head_pipeline": pipeline(sha=None)}, "pipeline_metadata_missing"),
+        ({"head_pipeline": pipeline(status="")}, "pipeline_metadata_missing"),
+        ({"head_pipeline": pipeline(created_at=None)}, "pipeline_metadata_missing"),
+        ({"head_pipeline": pipeline(sha="b" * 40)}, "pipeline_head_mismatch"),
+        ({"head_pipeline": pipeline(status="pending")}, "pipeline_not_running"),
+        ({"head_pipeline": pipeline(status="created")}, "pipeline_not_running"),
+        ({"head_pipeline": pipeline(status="success")}, "pipeline_not_running"),
+        ({"head_pipeline": pipeline(status="brand_new_status")}, "pipeline_not_running"),
+        ({"detailed_merge_status": "not_approved"}, "merge_gate_blocked"),
+        ({"detailed_merge_status": "discussions_not_resolved"}, "merge_gate_blocked"),
+        ({"detailed_merge_status": "conflict"}, "merge_gate_blocked"),
+        ({"detailed_merge_status": "need_rebase"}, "merge_gate_blocked"),
+        ({"detailed_merge_status": "", "merge_status": "cannot_be_merged"}, "merge_gate_blocked"),
+        ({"detailed_merge_status": "brand_new_gate"}, "merge_gate_unknown"),
+        ({"detailed_merge_status": ""}, "merge_gate_unknown"),
+    ]
+    for overrides, reason in cases:
+        proc, calls, payload = enable(mr_body(**overrides))
+        assert proc.returncode == 3, (overrides, proc.stderr or proc.stdout)
+        assert payload["result"] == "enable_refused" and payload["reason"] == reason, (overrides, payload)
+        assert payload["put_attempted"] is False, payload
+        assert calls == [MR_GET], (overrides, calls)
+    # the no-pipeline opt-out never relaxes the running-pipeline requirement
+    proc, calls = run_scenario({"mr": [ok(mr_body(head_pipeline=None))]}, "--enable", "--allow-no-pipeline")
+    payload = result_of(proc)
+    assert proc.returncode == 3 and payload["reason"] == "no_pipeline_observed", payload
+    assert calls == [MR_GET], calls
+    # the settling gates that clear by themselves are eligible
+    for gate in ["mergeable", "ci_still_running", "ci_must_pass", "checking"]:
+        proc, calls, payload = enable(mr_body(detailed_merge_status=gate))
+        assert proc.returncode == 0 and payload["result"] == "delegated_auto_merge", (gate, payload)
+        assert len(puts(calls)) == 1, (gate, calls)
+    # terminal CI keeps the no-flag triage result and exit 2, with no mutation
+    for overrides, result in [
+        ({"head_pipeline": pipeline(status="failed")}, "pipeline_failed"),
+        ({"head_pipeline": pipeline(status="canceled")}, "pipeline_canceled"),
+        ({"head_pipeline": pipeline(status="manual")}, "pipeline_manual"),
+        ({"head_pipeline": pipeline(status="skipped"), "detailed_merge_status": "ci_must_pass"}, "pipeline_skipped"),
+        ({"head_pipeline": pipeline(status="failed"), "draft": True}, "pipeline_failed"),
+    ]:
+        proc, calls, payload = enable(mr_body(**overrides))
+        assert proc.returncode == 2, (overrides, proc.stderr or proc.stdout)
+        assert payload["result"] == result and payload["failed_jobs"], (overrides, payload)
+        assert calls == [MR_GET, JOBS_GET], (overrides, calls)
+
+
+def test_enable_uses_newest_system_retarget() -> None:
+    # head pipeline created at 10:00; notes arrive newest first
+    newest_after_pipeline = [retarget("2026-09-24T10:05:00.000Z"), retarget("2026-09-24T09:00:00.000Z")]
+    proc, calls, payload = enable(mr_body(), notes=newest_after_pipeline)
+    assert proc.returncode == 3 and payload["reason"] == "pipeline_before_retarget", payload
+    assert not puts(calls), calls
+
+    capitalised = [retarget("2026-09-24T10:05:00.000Z", body="Changed target branch from `develop` to `main`")]
+    proc, calls, payload = enable(mr_body(), notes=capitalised)
+    assert payload["reason"] == "pipeline_before_retarget" and not puts(calls), payload
+
+    # a user comment quoting the phrase is not a retarget
+    quoted = [
+        retarget("2026-09-24T10:05:00.000Z", body="changed target branch from main? ask first", system=False),
+        retarget("2026-09-24T09:00:00.000Z"),
+    ]
+    proc, calls, payload = enable(mr_body(), notes=quoted)
+    assert proc.returncode == 0 and payload["result"] == "delegated_auto_merge", payload
+    assert len(puts(calls)) == 1, calls
+
+    # an unrelated newer system note does not stand in for the retarget time
+    unrelated_first = [
+        retarget("2026-09-24T10:30:00.000Z", body="added 1 commit"),
+        retarget("2026-09-24T09:00:00.000Z"),
+    ]
+    proc, calls, payload = enable(mr_body(), notes=unrelated_first)
+    assert proc.returncode == 0 and payload["result"] == "delegated_auto_merge", payload
+
+
+def test_enable_detects_automatic_retarget_on_branch_deletion() -> None:
+    # deleting the old target branch retargets the MR automatically, and some
+    # self-hosted GitLab versions record only this note, no "changed target branch"
+    body = "deleted the `feature/parent` branch. This merge request now targets the `main` branch"
+    note = retarget("2026-03-01T12:00:00.500Z", body=body)
+    before_note = mr_body(head_pipeline=pipeline(created_at="2026-03-01T11:59:58.000Z"))
+    proc, calls, payload = enable(before_note, notes=[note])
+    assert proc.returncode == 3 and payload["reason"] == "pipeline_before_retarget", payload
+    assert not puts(calls), calls
+    after_note = mr_body(head_pipeline=pipeline(created_at="2026-03-01T12:01:31.250Z"))
+    proc, calls, payload = enable(after_note, notes=[note])
+    assert proc.returncode == 0 and payload["result"] == "delegated_auto_merge", payload
+    assert len(puts(calls)) == 1, calls
+    # the same words in a user comment are not a retarget
+    proc, calls, payload = enable(before_note, notes=[retarget("2026-03-01T12:00:00.500Z", body=body, system=False)])
+    assert proc.returncode == 0 and payload["result"] == "delegated_auto_merge", payload
+
+
+def test_enable_retarget_boundary_and_page_limit() -> None:
+    # strictly after: a pipeline created at the retarget instant ran against
+    # either target, so it cannot authorize the merge
+    for note_time in ["2026-09-24T10:00:00.000Z", "2026-09-24T12:00:00.000+02:00"]:
+        proc, calls, payload = enable(mr_body(), notes=[retarget(note_time)])
+        assert proc.returncode == 3 and payload["reason"] == "pipeline_before_retarget", (note_time, payload)
+        assert not puts(calls), calls
+    proc, calls, payload = enable(mr_body(), notes=[retarget("2026-09-24T09:59:59.999Z")])
+    assert proc.returncode == 0 and payload["result"] == "delegated_auto_merge", payload
+
+    # a full page with no retarget leaves older history unread
+    unrelated = [retarget("2026-09-24T09:00:00.000Z", body="added 1 commit")]
+    proc, calls, payload = enable(mr_body(), notes=unrelated * 100)
+    assert proc.returncode == 3 and payload["reason"] == "retarget_history_incomplete", payload
+    assert not puts(calls), calls
+    proc, calls, payload = enable(mr_body(), notes=unrelated * 99)
+    assert proc.returncode == 0 and payload["result"] == "delegated_auto_merge", payload
+
+    # unreadable times refuse rather than guess
+    for before, notes in [
+        (mr_body(), [retarget("yesterday")]),
+        (mr_body(), [retarget("2026-09-24T09:00:00")]),
+        (mr_body(head_pipeline=pipeline(created_at="2026-09-24T10:00:00")), [retarget("2026-09-24T09:00:00Z")]),
+        (mr_body(head_pipeline=pipeline(created_at="not a time")), [retarget("2026-09-24T09:00:00Z")]),
+    ]:
+        proc, calls, payload = enable(before, notes=notes)
+        assert proc.returncode == 3 and payload["reason"] == "retarget_time_unknown", (notes, payload)
+        assert not puts(calls), calls
+
+    # an unexpected payload is not an empty history
+    for body in [{"message": "404 Not found"}, ["not a note"]]:
+        proc, calls, payload = enable(mr_body(), notes={"json": body})
+        assert proc.returncode == 3 and payload["reason"] == "retarget_history_incomplete", (body, payload)
+        assert not puts(calls), calls
+
+    # notes API failures are api_error, before any mutation
+    for response in [fail("HTTP 500"), {"stdout": "<html>login</html>"}]:
+        proc, calls, payload = enable(mr_body(), notes=response)
+        assert proc.returncode == 4 and payload["result"] == "api_error", (response, payload)
+        assert payload["put_attempted"] is False and calls == [MR_GET, NOTES_GET], (response, calls)
+
+
+def test_enable_already_enabled_is_idempotent() -> None:
+    for before in [
+        mr_body(merge_when_pipeline_succeeds=True),
+        # a server that reports only auto_merge
+        {key: value for key, value in mr_body(auto_merge=True).items() if key != "merge_when_pipeline_succeeds"},
+    ]:
+        proc, calls, payload = enable(before)
+        assert proc.returncode == 0 and payload["result"] == "delegated_auto_merge", payload
+        assert payload["put_attempted"] is False and calls == [MR_GET, NOTES_GET], calls
+    # an existing auto-merge never bypasses eligibility
+    for overrides, reason in [
+        ({"head_pipeline": pipeline(sha="b" * 40)}, "pipeline_head_mismatch"),
+        ({"head_pipeline": pipeline(status="success")}, "pipeline_not_running"),
+    ]:
+        proc, calls, payload = enable(mr_body(merge_when_pipeline_succeeds=True, **overrides))
+        assert proc.returncode == 3 and payload["reason"] == reason, (overrides, payload)
+        assert not puts(calls), calls
+    proc, calls, payload = enable(mr_body(merge_when_pipeline_succeeds=True), notes=[retarget("2026-09-24T10:05:00Z")])
+    assert proc.returncode == 3 and payload["reason"] == "pipeline_before_retarget", payload
+
+
+def test_enable_put_failure_never_retries() -> None:
+    unchanged = mr_body()
+    proc, calls, payload = enable(mr_body(), after=unchanged, put=fail("HTTP 502 Bad Gateway"))
+    assert proc.returncode == 4 and payload["result"] == "api_error", payload
+    assert payload["put_error"] == "HTTP 502 Bad Gateway" and payload["put_attempted"] is True, payload
+    assert len(puts(calls)) == 1 and calls[-1] == MR_GET and len(calls) == 4, calls
+
+    # the PUT timed out client-side but GitLab applied it: the re-read decides
+    proc, calls, payload = enable(mr_body(), after=mr_body(merge_when_pipeline_succeeds=True), put=fail("glab timed out", 124))
+    assert proc.returncode == 0 and payload["result"] == "delegated_auto_merge", payload
+    assert payload["put_error"] == "glab timed out" and len(puts(calls)) == 1, (payload, calls)
+
+    # the sha guard refused because the head moved: name the move
+    proc, calls, payload = enable(mr_body(), after=mr_body(sha="c" * 40), put=fail("HTTP 409 SHA does not match HEAD"))
+    assert proc.returncode == 3 and payload["result"] == "enable_not_confirmed", payload
+    assert payload["reason"] == "head_changed" and len(puts(calls)) == 1, (payload, calls)
+
+
+def test_enable_reports_merged_before_ci() -> None:
+    def merged(head_pipeline: object) -> dict[str, object]:
+        return mr_body(state="merged", merge_commit_sha="d" * 40, head_pipeline=head_pipeline)
+
+    for after in [
+        merged(pipeline()),
+        merged(pipeline(status="failed")),
+        merged(None),
+        merged(pipeline(id=124, status="success")),
+    ]:
+        proc, calls, payload = enable(mr_body(), after=after)
+        assert proc.returncode == 3 and payload["result"] == "merged_before_ci", (after, payload)
+        assert len(puts(calls)) == 1, calls
+    proc, calls, payload = enable(mr_body(), after=merged(pipeline(status="success")))
+    assert proc.returncode == 0 and payload["result"] == "merged", payload
+    assert payload["merge_commit"] == "d" * 40, payload
+    # a green pipeline confirms nothing about a head or target it never ran on
+    for changes, reason in [({"sha": "c" * 40}, "head_changed"), ({"target_branch": "release"}, "target_changed")]:
+        after = merged(pipeline(status="success"))
+        after.update(changes)
+        proc, calls, payload = enable(mr_body(), after=after)
+        assert proc.returncode == 3, (changes, proc.stderr or proc.stdout)
+        assert payload["result"] == "merged_before_ci" and payload["reason"] == reason, (changes, payload)
+
+
+def test_enable_requires_postread_confirmation() -> None:
+    for after, reason in [
+        (mr_body(), "auto_merge_not_enabled"),
+        (mr_body(merge_when_pipeline_succeeds=True, sha="c" * 40), "head_changed"),
+        (mr_body(merge_when_pipeline_succeeds=True, target_branch="release"), "target_changed"),
+        (mr_body(merge_when_pipeline_succeeds=True, state="closed"), "state_changed"),
+        (mr_body(merge_when_pipeline_succeeds=True, state="locked"), "state_changed"),
+    ]:
+        proc, calls, payload = enable(mr_body(), after=after)
+        assert proc.returncode == 3, (after, proc.stderr or proc.stdout)
+        assert payload["result"] == "enable_not_confirmed" and payload["reason"] == reason, (after, payload)
+        assert len(puts(calls)) == 1 and len(calls) == 4, calls
+    for reread in [fail("HTTP 503"), {"stdout": "<html>login</html>"}]:
+        scenario = {"mr": [ok(mr_body()), reread], "notes": [ok([])], "put": [ok(mr_body(merge_when_pipeline_succeeds=True))]}
+        proc, calls = run_scenario(scenario, "--enable")
+        payload = result_of(proc)
+        assert proc.returncode == 4 and payload["result"] == "api_error", payload
+        assert payload["put_attempted"] is True and len(puts(calls)) == 1, (payload, calls)
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):
