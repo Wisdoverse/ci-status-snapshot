@@ -26,7 +26,7 @@ from urllib.parse import quote, urlparse
 
 # One decision, one set of state tables: this helper names its results from the
 # same classifier the snapshot uses, so a provider enum change is a one-file fix.
-from ci_status_snapshot import PENDING_STATES, SUCCESS_STATES, classify_gitlab
+from ci_status_snapshot import PENDING_STATES, SUCCESS_STATES, classify_gitlab, gitlab_auto_merge_enabled
 
 
 def run(cmd: list[str], timeout: int = 25) -> tuple[int, str, str]:
@@ -182,7 +182,7 @@ def base_result(result: str, project: str, mr: str, data: dict[str, Any]) -> dic
         "state": data.get("state"),
         "sha": data.get("sha"),
         "merge_status": first(data, "detailed_merge_status", "detailedMergeStatus", "merge_status", "mergeStatus"),
-        "auto_merge": bool(first(data, "merge_when_pipeline_succeeds", "mergeWhenPipelineSucceeds")),
+        "auto_merge": gitlab_auto_merge_enabled(data),
         "draft": bool(first(data, "draft", "work_in_progress", "workInProgress")),
         "pipeline_id": first(pipeline, "id", "iid"),
         "pipeline_status": first(pipeline, "status", "detailedStatus", "detailed_status") or "unknown",
@@ -341,8 +341,6 @@ def api_json(path: str, *extra: str) -> tuple[Any, str]:
     return data, ""
 
 
-def auto_merge_enabled(data: dict[str, Any]) -> bool:
-    return first(data, "merge_when_pipeline_succeeds", "mergeWhenPipelineSucceeds", "auto_merge") is True
 
 
 def head_pipeline(data: dict[str, Any]) -> dict[str, Any]:
@@ -446,7 +444,7 @@ def confirmed_outcome(before: dict[str, Any], after: dict[str, Any]) -> tuple[st
         return "enable_not_confirmed", 3, "head_changed"
     if target_changed:
         return "enable_not_confirmed", 3, "target_changed"
-    if auto_merge_enabled(after):
+    if gitlab_auto_merge_enabled(after):
         return "delegated_auto_merge", 0, ""
     return "enable_not_confirmed", 3, "auto_merge_not_enabled"
 
@@ -457,7 +455,7 @@ def enable_gitlab_auto_merge(args: argparse.Namespace) -> int:
 
     def emit(result: str, data: dict[str, Any], code: int, **extra: Any) -> int:
         payload = base_result(result, project, mr, data)
-        payload["auto_merge"] = auto_merge_enabled(data)
+        payload["auto_merge"] = gitlab_auto_merge_enabled(data)
         payload["target_branch"] = first(data, "target_branch", "targetBranch")
         if norm(data.get("state")) == "merged":
             payload["merged_at"] = data.get("merged_at")
@@ -515,7 +513,7 @@ def enable_gitlab_auto_merge(args: argparse.Namespace) -> int:
     if refusal:
         return emit("enable_refused", before, 3, reason=refusal, put_attempted=False)
 
-    if auto_merge_enabled(before):
+    if gitlab_auto_merge_enabled(before):
         return emit("delegated_auto_merge", before, 0, put_attempted=False)
 
     # exactly one PUT, never retried: the sha guard makes GitLab refuse (409)

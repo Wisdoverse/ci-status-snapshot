@@ -283,6 +283,115 @@ def test_transient_gate_churn_stays_silent() -> None:
     assert event["current"]["merge_state"] == "mergeable"
 
 
+def run_reads(sequence: list[dict[str, object]]) -> tuple[dict[str, object], int, int]:
+    """(event, exit code, number of reads taken). Running out of reads is an error event."""
+    reads = 0
+    states = iter(sequence)
+
+    def next_state() -> dict[str, object]:
+        nonlocal reads
+        reads += 1
+        return next(states)
+
+    event, exit_code = watch(next_state, 0, 1, 0, sleep_fn=lambda _: None)
+    return event, exit_code, reads
+
+
+def with_(base: dict[str, object], **changes: object) -> dict[str, object]:
+    updated = dict(base)
+    updated.update(changes)
+    return updated
+
+
+def test_auto_merge_enable_is_silent_until_disabled() -> None:
+    off = snapshot("WAIT", 1)
+    on = with_(off, auto_merge=True)
+    # enabling is silent, and the new value is remembered so the later
+    # cancellation still wakes — including when the watcher started enabled
+    for sequence in [[off, on, off], [off, on, on, on, off], [on, on, off]]:
+        event, exit_code, reads = run_reads(sequence)
+        assert event["event"] == "change" and exit_code == 0, (sequence, event)
+        assert reads == len(sequence) and event["current"]["auto_merge"] is False, (reads, event)
+    # a missing field is no observation: silent, and not a cancellation
+    absent = dict(on)
+    absent.pop("auto_merge")
+    event, exit_code, reads = run_reads([on, absent, absent, with_(absent, conclusion="DONE")])
+    assert event["event"] == "change" and reads == 4 and event["current"]["conclusion"] == "DONE", (reads, event)
+    event, exit_code, reads = run_reads([on, absent, off])
+    assert event["event"] == "change" and reads == 3, (reads, event)
+
+
+def test_other_fingerprint_changes_and_transient_gates() -> None:
+    base = with_(snapshot("WAIT", 1), provider="gitlab", review=None, merge_state="not_approved")
+    # every other decision field still wakes on the same read auto-merge turns on
+    for change in [
+        {"head_sha": "def456"},
+        {"review": "APPROVED"},
+        {"draft": True},
+        {"state": "closed"},
+        {"merge_state": "mergeable"},
+        {"conclusion": "ACTION"},
+    ]:
+        event, exit_code, reads = run_reads([base, with_(base, auto_merge=True, **change)])
+        assert event["event"] == "change" and reads == 2, (change, event)
+    # transient gate churn stays folded while auto-merge turns on
+    solid = with_(base, merge_state="mergeable")
+    event, exit_code, reads = run_reads([
+        solid,
+        with_(solid, merge_state="checking", auto_merge=True),
+        with_(solid, merge_state="ci_still_running", auto_merge=True),
+        with_(solid, auto_merge=True),
+        with_(solid, merge_state="checking", auto_merge=True, conclusion="DONE"),
+    ])
+    assert event["event"] == "change" and reads == 5 and event["current"]["conclusion"] == "DONE", (reads, event)
+
+
+def gl_pipeline(pipeline_id: object = None, status: str = "unknown", **changes: object) -> dict[str, object]:
+    # the GitLab snapshot shape: ci carries the head pipeline id and status
+    base = with_(snapshot("WAIT", 1), provider="gitlab", review=None, merge_state="mergeable", target="main")
+    return with_(base, ci={"pipeline_id": pipeline_id, "status": status, "url": None}, **changes)
+
+
+def test_pipeline_appearing_starting_or_replaced_wakes() -> None:
+    absent = gl_pipeline()
+    for before, after in [
+        (absent, gl_pipeline(5, "running")),
+        (absent, gl_pipeline(5, "created")),
+        (gl_pipeline(5, "pending"), gl_pipeline(5, "running")),
+        (gl_pipeline(5, "running"), gl_pipeline(6, "running")),
+        (gl_pipeline(5, "pending"), gl_pipeline(6, "pending")),
+    ]:
+        event, exit_code, reads = run_reads([before, after])
+        assert event["event"] == "change" and exit_code == 0 and reads == 2, (before["ci"], after["ci"], event)
+
+
+def test_pipeline_churn_within_a_phase_stays_silent() -> None:
+    done = with_(gl_pipeline(5, "success"), conclusion="DONE")
+    for sequence in [
+        # not started yet: created -> pending -> ... is not a decision
+        [gl_pipeline(5, "created"), gl_pipeline(5, "waiting_for_resource"), gl_pipeline(5, "preparing"),
+         gl_pipeline(5, "pending"), gl_pipeline(5, ""), done],
+        # started: running, then green while an approval is still missing
+        [gl_pipeline(5, "running", merge_state="not_approved"), gl_pipeline(5, "running", merge_state="not_approved"),
+         gl_pipeline(5, "success", merge_state="not_approved"), with_(done, merge_state="not_approved")],
+        # no pipeline, read after read
+        [gl_pipeline(), gl_pipeline(), gl_pipeline(), with_(gl_pipeline(), conclusion="DONE")],
+    ]:
+        event, exit_code, reads = run_reads(sequence)
+        assert event["event"] == "change" and reads == len(sequence), (reads, event)
+        assert event["current"]["conclusion"] == "DONE", event
+    # GitHub reports check counts, not a head pipeline: per-check progress is silent
+    event, exit_code, reads = run_reads([snapshot("WAIT", 3), snapshot("WAIT", 0), snapshot("DONE", 0)])
+    assert reads == 3 and event["current"]["conclusion"] == "DONE", (reads, event)
+
+
+def test_target_change_wakes() -> None:
+    for base in [with_(snapshot("WAIT", 1), target="main"), gl_pipeline(5, "running")]:
+        event, exit_code, reads = run_reads([base, with_(base, target="release")])
+        assert event["event"] == "change" and exit_code == 0 and reads == 2, (base["provider"], event)
+        assert event["current"]["target"] == "release", event
+
+
 def test_allow_no_pipeline_cli_routing() -> None:
     # the opt-out reaches the provider on EVERY poll, not only the first read
     import io

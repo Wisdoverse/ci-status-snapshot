@@ -145,6 +145,15 @@ def first(data: dict[str, Any], *keys: str) -> Any:
     return None
 
 
+# GitLab reports delegated merge under different names by version (merge_when_pipeline_succeeds,
+# auto_merge; camelCase from GraphQL-shaped output). Enabled if any of them is true.
+GITLAB_AUTO_MERGE_KEYS = ("merge_when_pipeline_succeeds", "mergeWhenPipelineSucceeds", "auto_merge", "auto_merge_enabled", "autoMergeEnabled")
+
+
+def gitlab_auto_merge_enabled(data: dict[str, Any]) -> bool:
+    return any(data.get(key) is True for key in GITLAB_AUTO_MERGE_KEYS)
+
+
 def load_json_or_die(raw: str, source: str) -> Any:
     try:
         return json.loads(raw)
@@ -429,7 +438,7 @@ def gitlab_snapshot(selector: str | None, allow_no_pipeline: bool = False) -> di
         "target": first(data, "target_branch", "targetBranch"),
         "merge_state": detailed_merge or merge_status,
         "draft": draft,
-        "auto_merge": bool(first(data, "merge_when_pipeline_succeeds", "mergeWhenPipelineSucceeds", "auto_merge_enabled")),
+        "auto_merge": gitlab_auto_merge_enabled(data),
         "ci": {
             "pipeline_id": first(pipeline, "id", "iid"),
             "status": pipeline_status or "unknown",

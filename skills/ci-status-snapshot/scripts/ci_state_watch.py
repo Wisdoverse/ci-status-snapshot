@@ -13,7 +13,7 @@ from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any
 
-from ci_status_snapshot import detect_provider, github_snapshot, gitlab_snapshot
+from ci_status_snapshot import FAIL_STATES, SUCCESS_STATES, detect_provider, github_snapshot, gitlab_snapshot
 
 
 def take_snapshot(provider: str, selector: str, allow_no_pipeline: bool = False) -> dict[str, Any]:
@@ -49,25 +49,54 @@ def is_transient_merge_state(value: Any) -> bool:
     return value is None or (isinstance(value, str) and value.lower() in TRANSIENT_MERGE_STATES)
 
 
+# GitLab head-pipeline statuses that count as `started`: running, or already
+# finished. How a pipeline finished is the conclusion's job: failure wakes as
+# ACTION, success with a mergeable gate as DONE, and a merge by auto-merge as
+# merged. The one transition left silent, success while a human gate
+# (approval) still blocks, leaves the agent nothing to do (--enable needs a
+# running pipeline); the approval itself wakes through the merge gate.
+STARTED_PIPELINE_STATES = frozenset({"running", "canceling", "manual", "skipped"}) | FAIL_STATES | SUCCESS_STATES
+
+
+def pipeline_phase(snapshot: dict[str, Any]) -> list[Any] | None:
+    """Coarse GitLab head-pipeline phase plus its id; None for GitHub snapshots.
+
+    absent (no pipeline id) -> present (id, not started yet) -> started
+    (running or finished). A pipeline appearing, starting or being replaced by a new id is
+    decision-relevant (it is when --enable becomes possible); per-job progress
+    and created -> pending churn inside `present` are not.
+    """
+    ci = snapshot.get("ci")
+    if not isinstance(ci, dict) or "pipeline_id" not in ci:
+        return None
+    pipeline_id = ci.get("pipeline_id")
+    if pipeline_id in (None, ""):
+        return ["absent", None]
+    status = str(ci.get("status") or "").strip().lower()
+    return ["started" if status in STARTED_PIPELINE_STATES else "present", pipeline_id]
+
+
 def fingerprint(snapshot: dict[str, Any], solid_merge_state: Any) -> str:
     # Only decision-relevant fields: conclusion flips (WAIT->ACTION/DONE), a new
-    # push, human gates moving (review decision on GitHub — GitLab surfaces
-    # approvals via merge_state — draft toggle, merge gate), or someone
-    # disabling delegated auto-merge. Per-check progress (ci counts,
-    # pending_checks) is deliberately excluded — waking the agent on every
-    # completed check degrades into slow polling — and so are transient
+    # push, a retarget, the GitLab head pipeline appearing/starting/being
+    # replaced, human gates moving (review decision on GitHub — GitLab surfaces
+    # approvals via merge_state — draft toggle, merge gate). Per-check progress
+    # (ci counts, pending_checks) is deliberately excluded — waking the agent on
+    # every completed check degrades into slow polling — and so are transient
     # merge-gate states, which carry the last solid value instead (see
-    # TRANSIENT_MERGE_STATES).
+    # TRANSIENT_MERGE_STATES). auto_merge is not here either: watch() tracks it
+    # separately so that only its cancellation wakes.
     stable = {
         "provider": snapshot.get("provider"),
         "number": snapshot.get("number"),
         "conclusion": snapshot.get("conclusion"),
         "state": snapshot.get("state"),
         "head_sha": snapshot.get("head_sha"),
+        "target": snapshot.get("target"),
+        "pipeline": pipeline_phase(snapshot),
         "review": snapshot.get("review"),
         "merge_state": solid_merge_state,
         "draft": snapshot.get("draft"),
-        "auto_merge": snapshot.get("auto_merge"),
     }
     return json.dumps(stable, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
 
@@ -84,6 +113,10 @@ def watch(
     started = monotonic_fn()
     baseline: str | None = None
     solid_merge_state: Any = None
+    # last observed auto-merge value. Turning it on is the delegation the agent
+    # itself asked for, so it is silent; turning it off (someone cancelled it,
+    # or GitLab dropped it after a push) is a decision the agent must see
+    auto_merge_on: bool | None = None
     errors = 0
     total_errors = 0
     last_error = ""
@@ -99,6 +132,10 @@ def watch(
             if not is_transient_merge_state(current.get("merge_state")):
                 solid_merge_state = current.get("merge_state")
             current_fingerprint = fingerprint(current, solid_merge_state)
+            observed_auto_merge = current.get("auto_merge")
+            auto_merge_cancelled = auto_merge_on is True and observed_auto_merge is not None and not observed_auto_merge
+            if observed_auto_merge is not None:
+                auto_merge_on = bool(observed_auto_merge)
             errors = 0
             last_error = ""
             if baseline is None:
@@ -115,7 +152,7 @@ def watch(
                 if current.get("conclusion") != "WAIT":
                     return {"event": "change", "initial": True, "current": current}, 0
                 baseline = current_fingerprint
-            elif current_fingerprint != baseline:
+            elif current_fingerprint != baseline or auto_merge_cancelled:
                 return {"event": "change", "current": current}, 0
         # broad on purpose: the notify contract is exactly one JSON event, so
         # any per-poll failure (OSError from subprocess, TypeError on odd CLI

@@ -474,6 +474,23 @@ def test_allow_no_pipeline_cli_routing() -> None:
             assert calls == [(provider, "12", expected)], (provider, flags, calls)
 
 
+def test_gitlab_auto_merge_read_from_every_field_name() -> None:
+    # Servers report delegated merge as merge_when_pipeline_succeeds, auto_merge, or both; the
+    # watcher's cancellation wake depends on reading it the same way the delegate does.
+    for fields, expected in [
+        ({"auto_merge": True}, True),
+        ({"merge_when_pipeline_succeeds": True}, True),
+        ({"merge_when_pipeline_succeeds": False, "auto_merge": True}, True),
+        ({"merge_when_pipeline_succeeds": False}, False),
+        ({"auto_merge": "true"}, False),
+        ({}, False),
+    ]:
+        assert css.gitlab_auto_merge_enabled(fields) is expected, fields
+        stub({"iid": 3, "state": "opened", "detailed_merge_status": "ci_still_running",
+              "head_pipeline": {"id": 9, "status": "running"}, **fields})
+        assert css.gitlab_snapshot("3")["auto_merge"] is expected, fields
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):
