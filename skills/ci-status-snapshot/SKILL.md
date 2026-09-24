@@ -1,6 +1,6 @@
 ---
 name: ci-status-snapshot
-description: Token-efficient GitLab CI, GitHub Checks, MR, and PR status handling with one-shot snapshots or a silent local watcher that notifies the agent only when state changes. Use when the user asks whether CI passed, wants an active goal to continue through CI/review waits, asks to merge after checks, wants provider auto-merge, or corrects model-driven polling.
+description: Token-efficient GitLab CI, GitHub Checks, MR, and PR status handling with one-shot snapshots or a silent local watcher that notifies the agent only when state changes. Use when the user asks whether CI passed, wants an active goal to continue through CI/review waits, asks to merge after checks, wants provider auto-merge, or corrects model-driven polling. Also use proactively, without being asked, whenever you are about to wait on a PR, MR or pipeline you created or pushed to (checks, review or merge), or are about to sleep, re-run a status command, or otherwise poll for CI.
 ---
 
 # CI Status Snapshot
@@ -22,7 +22,7 @@ The authoritative rule list. Everything below is binding.
 - Treat `WAIT` and `delegated_auto_merge` as watcher-arm outcomes when an active Goal depends on later state. Prefer provider-side auto-merge over local polling whenever possible.
 - Run only `scripts/ci_state_watch.py` for local waiting. Keep it attached to a deferred tool call so its single exit event becomes a tool notification and it cannot become an orphan process; do not use `nohup`, `&`, detached terminal sessions, or polling subagents.
 - Pass `--expected-head` with the full SHA from the handoff snapshot (`head_sha`, or delegate `sha`). The first read emits immediately if that head changed even when it is still `WAIT`, or if the state is already `ACTION`/`DONE`. Without a prior snapshot, the argument is optional and the first `WAIT` becomes the baseline.
-- The watcher stays silent until a decision-relevant fingerprint changes: conclusion, head, PR/MR state, review gate, draft or auto-merge. Per-job progress and transient merge-gate churn do not wake the model. It also exits after three consecutive errors or timeout; these are watcher failures, not CI failures.
+- The watcher stays silent until a decision-relevant fingerprint changes — conclusion, head, target branch, PR/MR state, review gate, draft, or the GitLab head pipeline appearing, starting or being replaced — or until auto-merge is cancelled. Enabling auto-merge, per-job progress, a pipeline moving between not-yet-started states and transient merge-gate churn do not wake the model. A pipeline finishing wakes only through the conclusion (failure as `ACTION`, a mergeable success as `DONE`); a green pipeline still waiting on approval stays silent, and the approval wakes it through the merge gate. It also exits after three consecutive errors or timeout; these are watcher failures, not CI failures.
 - After the tool yields control, do not call `wait`, `write_stdin`, poll methods, or another snapshot command to inspect it. Continue useful work and consume the runtime's completion notification when it arrives.
 - Treat `event.current` in that notification as the fresh snapshot; do not immediately query the same state again. Re-read only when an exact-head mutation such as merge requires it.
 - Error/timeout events identify the target in `watch` and preserve a timestamped `last_snapshot` when available. That observation is stale context, not `current`. Diagnose the reported failure once; if resolved and the Goal still needs this target, re-arm one watcher. Do not auto-retry indefinitely, create a second watcher, or silently leave the Goal with no event source.
@@ -65,9 +65,9 @@ python3 "$SKILL_DIR/scripts/ci_merge_delegate.py" \
   --json
 ```
 
-Pass `--project <id-or-path>` when the project cannot be inferred from the git remote. The helper never waits: with CI running and server-side auto-merge enabled it emits `delegated_auto_merge` and exits.
+Pass `--project <id-or-path>` when the project cannot be inferred from the git remote. The helper never waits: with CI running and server-side auto-merge enabled it emits `delegated_auto_merge` and exits. Add `--enable` to turn GitLab auto-merge on for the MR's current head — at most one guarded PUT, confirmed by one re-read; read `$SKILL_DIR/references/merge-flow.md` before using it.
 
-Delegate exit codes: `0` = nothing to do now, `2` = terminal pipeline state, triage the failed jobs, `3` = a human must act, `4` = `api_error`. Exit `0` does not mean merged — always read `result`, and treat a `failed_jobs_error` field as "job list unavailable", never as zero failed jobs.
+Delegate exit codes: `0` = nothing to do now, `2` = terminal pipeline state, triage the failed jobs, `3` = a human must act (with `--enable` also `merged_before_ci`, and `enable_refused`/`enable_not_confirmed`, which name a `reason`), `4` = `api_error`. Exit `0` does not mean merged — always read `result`, and treat a `failed_jobs_error` field as "job list unavailable", never as zero failed jobs.
 
 When the user asks to submit, merge, "merge when CI passes", or to delegate the merge, read `$SKILL_DIR/references/merge-flow.md` first: merge flow, delegation-helper contract, per-exit-code result names, compact `glab api ... | jq` MR field snapshot, GitLab host/legacy caveats.
 
@@ -85,16 +85,18 @@ If CLI flags differ on the host, run the relevant `--help` command once and adap
 Return one of three outcomes:
 
 - `ACTION`: failed or canceled CI, merge conflict, required manual job, rejected review, branch needs rebase/update, or a concrete blocker that can be fixed now.
-- `WAIT`: CI is running/pending/queued, the PR/MR is still a draft, review or approval is required, merge-when-pipeline-succeeds/auto-merge is enabled, or there is no actionable failure yet. Arm the local watcher when an active Goal depends on later state.
+- `WAIT`: CI is running/pending/queued or has not appeared yet, the PR/MR is still a draft, review or approval is required, merge-when-pipeline-succeeds/auto-merge is enabled, or there is no actionable failure yet. Arm the local watcher when an active Goal depends on later state.
 - `DONE`: merged, closed intentionally, or all checks are green and no obvious remote blocker remains. The helpers require positive merge evidence for that last case — GitHub `mergeStateStatus` `CLEAN`/`HAS_HOOKS`, GitLab `detailed_merge_status: mergeable`. A green pipeline alone is never `DONE`; a still-running pipeline stays `WAIT` even when the GitLab gate already reports `mergeable` (CI is not a required merge check there); and an unrecognized provider state is `WAIT`.
+
+Missing CI is `WAIT`, not `DONE`: right after a push GitLab can report `mergeable` before it creates the head pipeline (reason `no pipeline observed`), and GitHub can report `CLEAN` before a single check run registers (`no checks reported yet`). The watcher follows that state until CI appears. Pass `--allow-no-pipeline` to the snapshot, watcher and delegate only for a project that runs no CI for this PR/MR; an identified pipeline with an empty or unrecognized status stays `WAIT` regardless.
 
 `DONE` is the MR/PR decision, not blanket CI or delivery acceptance: merged/closed takes precedence in the classifier. Always report `ci` separately; merged with failed/pending CI does not mean validation passed, and closed-unmerged does not satisfy a merge request. Cleanup still requires exact merged-head and clean-worktree proof.
 
 For `ACTION`, fetch only the failed job logs needed for the next fix. Summarize the failing lines; do not paste full logs unless the user asks. Before triaging a failed, canceled, or manual GitLab pipeline — or a job that looks stuck — read `$SKILL_DIR/references/gitlab-triage.md` (fetch recipes, infrastructure-vs-code-defect rule, never-auto-retry-lint/test rule, stuck-runner flow).
 
-For `WAIT`, arm the watcher instead of taking another snapshot. If the user requested merge, first enable merge-when-pipeline-succeeds or auto-merge when policy and permissions allow.
+For `WAIT`, arm the watcher instead of taking another snapshot. If the user requested merge, first enable merge-when-pipeline-succeeds or auto-merge when policy and permissions allow (GitLab: `ci_merge_delegate.py --enable`).
 
-For `DONE`, report the result and avoid extra remote calls. Exception: a GitHub `DONE` with reason `no checks reported` taken within ~60s of a push may be the check-registration race (Actions has not registered its check runs yet) — wait 60 seconds and take exactly one fresh snapshot before merging.
+For `DONE`, report the result and avoid extra remote calls.
 
 ## Token Rules
 
