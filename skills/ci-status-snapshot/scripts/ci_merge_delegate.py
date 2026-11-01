@@ -353,7 +353,7 @@ def text(value: Any) -> str:
 
 
 def parse_gitlab_time(value: Any) -> datetime | None:
-    """A timezone-aware timestamp, or None. Python 3.9 rejects a trailing Z."""
+    """A timezone-aware timestamp, or None; accept both Z and z suffixes."""
     raw = value.strip() if isinstance(value, str) else ""
     if raw[-1:] in {"Z", "z"}:
         raw = raw[:-1] + "+00:00"
