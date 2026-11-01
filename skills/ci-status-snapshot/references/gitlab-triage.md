@@ -16,7 +16,7 @@ glab api "projects/<project_id>/jobs/<job_id>/trace" | tail -n 160
 
 ## Infrastructure failure, not a code defect
 
-If the failed job trace shows the runner failed before project scripts ran, classify it as CI infrastructure rather than a code defect. Common examples include Docker executor preparation timeouts, `Failed to remove network for build`, source checkout timeouts in `get_sources`, or service container startup timeouts before `script`. Retry only the failed job with the provider API at most once, then take one compact MR snapshot. If the replacement job is pending/running and auto-merge is enabled, report delegated/pending and stop. If the same infrastructure class repeats, stop and report the runner/checkout blocker instead of changing code.
+If the failed job trace shows the runner failed before project scripts ran, classify it as CI infrastructure rather than a code defect. Common examples include Docker executor preparation timeouts, `Failed to remove network for build`, source checkout timeouts in `get_sources`, or service container startup timeouts before `script`. Retry only the failed job with the provider API at most once, then follow "After a retry" below. If the same infrastructure class repeats, stop retrying and report the runner/checkout blocker instead of changing code.
 
 ## Never auto-retry a quality gate
 
@@ -24,7 +24,7 @@ Never auto-retry a failed `lint`/`test`/`gofmt`/typecheck job (any in-`script` q
 
 ## Stuck runner or job
 
-If the current snapshot or the user shows that a GitLab job is already `running` far beyond normal duration and its trace is empty, treat it as a possible stuck runner/job instead of waiting again. Take one diagnostic snapshot: current job status, duration, runner status, trace tail, and recent same-name job durations. If recent successful same-name jobs are much shorter and there is no script output or failed trace, cancel and retry only that job, at most once; do not rerun the whole pipeline or push a no-op commit. Then take one final compact snapshot and stop.
+If the current snapshot or the user shows that a GitLab job is already `running` far beyond normal duration and its trace is empty, treat it as a possible stuck runner/job instead of waiting again. Take one diagnostic snapshot: current job status, duration, runner status, trace tail, and recent same-name job durations. If recent successful same-name jobs are much shorter and there is no script output or failed trace, cancel and retry only that job, at most once; do not rerun the whole pipeline or push a no-op commit. Then follow "After a retry" below.
 
 ```bash
 job=<job_id>
@@ -44,4 +44,10 @@ glab api -X POST "projects/<project_id>/jobs/${job}/retry" \
   | jq -r '["retry_id="+(.id|tostring),"retry_status="+.status,"retry_web_url="+.web_url] | .[]'
 ```
 
-After a single-job retry, re-check the MR compact fields once. If auto-merge stayed enabled and the replacement job is pending/running, report delegated/pending and stop. If the replacement fails, fetch only that job's trace tail and triage normally.
+## After a retry
+
+Keep the original/replacement job IDs and the retry already used across watcher events and context handoffs; re-arming does not reset the one-retry limit. Reuse sufficient mutation fields, or take one compact MR snapshot to establish the current head, CI and delegation state.
+
+If the state is `WAIT`/delegated and the task still requires CI completion or merge, resume the watcher flow in `SKILL.md`: reuse a live watcher for the same target/head, or confirm the old watcher exited and arm one replacement with `--expected-head`. Handle lost delegation under `references/merge-flow.md`. A standalone status/retry request may finish with a pending report; an unfinished merge request needs continued result collection, not just "delegated/pending and stop".
+
+If the replacement fails, fetch only that job's trace tail and triage normally. Stop automatic retries when the same infrastructure failure repeats, and report the blocker; do not re-arm a watcher against unchanged `ACTION` as a substitute for resolution.

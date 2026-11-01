@@ -101,7 +101,7 @@ python3 scripts/ci_state_watch.py --provider github --selector 123 --expected-he
 
 # GitLab auto-merge delegation snapshot (never blocks)
 # exit 0 = merged/delegated_auto_merge/waiting/no_pipeline_observed, 2 = pipeline
-# needs triage, 3 = a human must act, 4 = api_error — always read `result`
+# needs triage, 3 = action required, 4 = api_error — always read `result`
 python3 scripts/ci_merge_delegate.py --provider gitlab --selector 396 --json
 
 # Guarded enablement: at most one PUT for the MR's current head, only while its
