@@ -16,13 +16,13 @@ When the user asks to submit, merge, or "merge when CI passes", do the remote wo
 7. When cleanup is authorized, verify the exact merged source head, integration ancestry (or reviewed squash equivalence), clean owned worktree and no open dependents. Then fast-forward the repository's integration checkout if safe and remove only the proved-owned feature worktree/branch. Preserve unrelated dirt and closed-unmerged work; do not assume every repository uses `DEV`.
 8. If the user asks to ensure the MR merges, enable server-side auto-merge for the exact head (GitLab: `--enable`). Reuse the returned state or run `$SKILL_DIR/scripts/ci_merge_delegate.py` once if needed to confirm delegation, then arm the local watcher while the Goal remains unfinished. Retain its target, head and attached tool handle for handoff.
 
-Do not wait for a running pipeline in model turns. Server-side auto-merge preserves merge intent; the local watcher supplies the event that resumes the Goal.
+Do not poll a running pipeline in model turns. Server-side auto-merge preserves merge intent; collect and handle the local watcher's exit event using the runtime rules in `SKILL.md`.
 
 ## Delegation Snapshot
 
 Run the bundled GitLab auto-merge delegation helper (command in `SKILL.md`, Snapshot First) to confirm that merge is delegated to GitLab auto-merge or to surface an immediate terminal blocker.
 
-Result per exit code: `0` = nothing to do now (`result` is `merged`, `delegated_auto_merge`, `waiting`, or `no_pipeline_observed`), `2` = terminal pipeline state, triage the failed jobs, `3` = a human must act (`closed_unmerged`, `merge_blocked`, `pipeline_success_unmerged`, `pipeline_skipped_mergeable`, `mergeable_unmerged`), `4` = `api_error`. An open, mergeable MR with no head pipeline is `no_pipeline_observed` (CI has not appeared yet); `--allow-no-pipeline`, for projects that run no pipeline, reports it as `mergeable_unmerged` instead. Exit `0` does not mean merged — always read the `result` field. A `failed_jobs_error` field means the job list could not be fetched; it is not the same as zero failed jobs.
+Result per exit code: `0` = nothing to do now (`result` is `merged`, `delegated_auto_merge`, `waiting`, or `no_pipeline_observed`), `2` = terminal pipeline state, triage the failed jobs, `3` = action required (`closed_unmerged`, `merge_blocked`, `pipeline_success_unmerged`, `pipeline_skipped_mergeable`, `mergeable_unmerged`), `4` = `api_error`. An open, mergeable MR with no head pipeline is `no_pipeline_observed` (CI has not appeared yet); `--allow-no-pipeline`, for projects that run no pipeline, reports it as `mergeable_unmerged` instead. Exit `0` does not mean merged — always read the `result` field. A `failed_jobs_error` field means the job list could not be fetched; it is not the same as zero failed jobs.
 
 The helper must:
 
