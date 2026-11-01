@@ -76,7 +76,7 @@ Do not keep a manual copy and the plugin install side by side — the skill woul
 
 ## Requirements
 
-- Python 3.9 or newer, standard library only — no `pip install`, no virtualenv.
+- Python 3.11 or newer, standard library only — no `pip install`, no virtualenv.
 - `git`, plus the provider CLI you use: [`gh`](https://cli.github.com/) for GitHub, [`glab`](https://gitlab.com/gitlab-org/cli) for GitLab, authenticated.
 
 ## Usage
